@@ -1,6 +1,6 @@
 [package]
 name = "gnirehtet"
-version = "2.6.0"
+version = "2.6.2"
 authors = ["Romain Vimont <rom@rom1v.com>"]
 edition = "2024"
 description = "Reverse tethering for Android — share your computer's internet with an Android device via USB/ADB"
@@ -25,3 +25,6 @@ libc = "0.2"
 
 [profile.release]
 lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

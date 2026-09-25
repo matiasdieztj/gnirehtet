@@ -22,7 +22,7 @@ use crate::execution_error::{Cmd, CommandExecutionError, ProcessIoError, Process
 
 const TAG: &str = "Adb";
 
-pub const REQUIRED_APK_VERSION_CODE: &str = "10";
+pub const REQUIRED_APK_VERSION_CODE: &str = "11";
 
 static ADB_PATH: OnceLock<String> = OnceLock::new();
 
