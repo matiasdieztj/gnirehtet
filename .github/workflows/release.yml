@@ -199,63 +199,61 @@ jobs:
             binary: gnirehtet
 
           # -----------------------------------------------------------------
-          # Windows — Tier 1 targets (Windows 10+)
-          #   i686     → native on windows-latest
-          #   x86_64   → native on windows-latest
-          #   aarch64  → cargo-xwin on ubuntu-latest (GitHub runners have
-          #              no Windows ARM64 hardware and the x64 MSVC
-          #              toolchain cannot link ARM64)
+          # Windows — GNU (MinGW-w64) via cargo-zigbuild.
+          #
+          # Zig provides a complete MinGW-w64 sysroot for every Windows
+          # target, so no Microsoft SDK is required. This works entirely
+          # from ubuntu-latest and avoids the SDK download and the
+          # WSAEFAULT-style bugs of cargo-xwin.
+          #
+          # The `gnullvm` suffix on ARM64 means "LLVM-based MinGW-w64",
+          # which is what Zig ships for that architecture.
           # -----------------------------------------------------------------
           - name: windows-i686
-            os: windows-latest
-            rust-target: i686-pc-windows-msvc
-            builder: native
+            os: ubuntu-latest
+            rust-target: i686-pc-windows-gnu
+            builder: zigbuild
             suffix: windows-i686
             binary: gnirehtet.exe
 
           - name: windows-x86_64
-            os: windows-latest
-            rust-target: x86_64-pc-windows-msvc
-            builder: native
+            os: ubuntu-latest
+            rust-target: x86_64-pc-windows-gnu
+            builder: zigbuild
             suffix: windows-x86_64
             binary: gnirehtet.exe
 
           - name: windows-arm64
             os: ubuntu-latest
-            rust-target: aarch64-pc-windows-msvc
-            builder: xwin
+            rust-target: aarch64-pc-windows-gnullvm
+            builder: zigbuild
             suffix: windows-arm64
             binary: gnirehtet.exe
 
           # -----------------------------------------------------------------
           # Windows — Tier 3 targets for Windows 7 and 8.1.
           #
-          # These use nightly + `-Z build-std` because the win7 targets
-          # are not distributed via rustup. They cover Windows 7, 8, 8.1,
-          # 10 and 11 in one binary each (Windows maintains binary
-          # backward compatibility).
+          # These are not distributed via rustup, so they require nightly +
+          # `-Z build-std`. The resulting binary runs on Windows 7, 8, 8.1,
+          # 10 and 11 (Windows maintains binary backward compatibility).
           #
           # Vista is IMPOSSIBLE: Rust never had Vista support.
           #
-          # These are marked 'experimental' so a Tier 3 breakage does not
-          # block the rest of the release. If they fail, the other 12
-          # artifacts still publish normally.
-          #
-          # These jobs benefit the most from caching: `-Z build-std`
-          # recompiles the entire standard library on every run.
+          # Both are marked 'experimental' so a Tier 3 breakage does not
+          # block the rest of the release.
           # -----------------------------------------------------------------
           - name: windows-x86_64-win7
             os: ubuntu-latest
-            rust-target: x86_64-win7-windows-msvc
-            builder: win7
+            rust-target: x86_64-win7-windows-gnu
+            builder: zigbuild-win7
             suffix: windows-x86_64-win7
             binary: gnirehtet.exe
             experimental: true
 
           - name: windows-i686-win7
             os: ubuntu-latest
-            rust-target: i686-win7-windows-msvc
-            builder: win7
+            rust-target: i686-win7-windows-gnu
+            builder: zigbuild-win7
             suffix: windows-i686-win7
             binary: gnirehtet.exe
             experimental: true
@@ -272,13 +270,13 @@ jobs:
       # because they are Tier 3 and require `-Z build-std`.
       # ------------------------------------------------------------------
       - name: Install Rust toolchain (stable)
-        if: matrix.builder != 'win7'
+        if: matrix.builder != 'zigbuild-win7'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.install-targets || matrix.rust-target }}
 
       - name: Install Rust toolchain (nightly, for win7 targets)
-        if: matrix.builder == 'win7'
+        if: matrix.builder == 'zigbuild-win7'
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -370,30 +368,86 @@ jobs:
         run: cargo install --locked cross
 
       - name: Install Zig
-        if: matrix.builder == 'zigbuild'
+        if: matrix.builder == 'zigbuild' || matrix.builder == 'zigbuild-win7'
         shell: bash
         run: |
           set -euo pipefail
-          ZIG_VERSION=0.13.0
-          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+          ZIG_VERSION=0.16.0
+          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
             | tar -xJ -C /tmp
-          sudo mv "/tmp/zig-linux-x86_64-${ZIG_VERSION}" /opt/zig
+          sudo mv "/tmp/zig-x86_64-linux-${ZIG_VERSION}" /opt/zig
           sudo ln -sf /opt/zig/zig /usr/local/bin/zig
           zig version
 
       - name: Install cargo-zigbuild
-        if: matrix.builder == 'zigbuild'
+        if: matrix.builder == 'zigbuild' || matrix.builder == 'zigbuild-win7'
         run: cargo install --locked cargo-zigbuild
-
-      - name: Install clang + lld (for cargo-xwin and win7)
-        if: matrix.builder == 'xwin' || matrix.builder == 'win7'
+      
+      # ------------------------------------------------------------------
+      # Windows 7 compatibility shim.
+      #
+      # The target *-win7-windows-gnu cannot link against the real
+      # synchronization.lib (it does not exist in MinGW-w64 or Zig). We
+      # compile a drop-in replacement DLL that implements WaitOnAddress
+      # and WakeByAddress* using the NT Keyed Events API (available since
+      # Windows XP), and generate a fake libsynchronization.a so the
+      # linker finds the symbols.
+      #
+      # Source: https://github.com/cristianadam/api-ms-win-core-synch-Win7
+      # ------------------------------------------------------------------
+      - name: Install MinGW-w64 (for the Win7 shim)
+        if: matrix.builder == 'zigbuild-win7'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld
+          sudo apt-get install -y \
+            mingw-w64 \
+            mingw-w64-common \
+            mingw-w64-x86-64-dev \
+            mingw-w64-i686-dev
 
-      - name: Install cargo-xwin
-        if: matrix.builder == 'xwin' || matrix.builder == 'win7'
-        run: cargo install --locked cargo-xwin
+      - name: Build Win7 synchronization shim
+        if: matrix.builder == 'zigbuild-win7'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.rust-target }}" in
+            i686-win7-windows-gnu)   PREFIX=i686-w64-mingw32 ;;
+            x86_64-win7-windows-gnu) PREFIX=x86_64-w64-mingw32 ;;
+            *) echo "::error::Unknown win7 target"; exit 1 ;;
+          esac
+
+          mkdir -p shim-src
+          curl -fsSL -o shim-src/shim.c \
+            "https://raw.githubusercontent.com/cristianadam/api-ms-win-core-synch-Win7/main/api-ms-win-core-synch-l1-2-0.c"
+
+          # Linux is case-sensitive: the upstream source includes <Windows.h>,
+          # but MinGW-w64 ships the header as <windows.h>.
+          sed -i 's/#include <Windows\.h>/#include <windows.h>/' shim-src/shim.c
+
+          ${PREFIX}-gcc -shared -O2 -s \
+            -o shim-src/api-ms-win-core-synch-l1-2-0.dll \
+            shim-src/shim.c \
+            -lkernel32
+
+          cat > shim-src/synchronization.def <<'EOF'
+          LIBRARY api-ms-win-core-synch-l1-2-0.dll
+          EXPORTS
+            WaitOnAddress
+            WakeByAddressSingle
+            WakeByAddressAll
+          EOF
+
+          ${PREFIX}-dlltool -d shim-src/synchronization.def \
+            -l shim-src/libsynchronization.a
+
+          mkdir -p relay-rust/.win7-shim/${{ matrix.rust-target }}
+          cp shim-src/libsynchronization.a \
+            relay-rust/.win7-shim/${{ matrix.rust-target }}/
+
+          echo "Shim built:"
+          file shim-src/api-ms-win-core-synch-l1-2-0.dll
+          ls -la shim-src/libsynchronization.a
 
       # ------------------------------------------------------------------
       # Build
@@ -407,6 +461,7 @@ jobs:
 
       - name: Build (native, macOS / Windows)
         if: matrix.builder == 'native'
+        shell: bash
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
         run: |
@@ -433,20 +488,26 @@ jobs:
           echo "cargo zigbuild --release --target $TARGET"
           cargo zigbuild --release --target "$TARGET" \
             --manifest-path relay-rust/Cargo.toml
-
-      - name: Build (cargo-xwin, Windows ARM64)
-        if: matrix.builder == 'xwin'
+        
+      - name: Build (zigbuild, Windows GNU)
+        if: matrix.builder == 'zigbuild' && contains(matrix.rust-target, 'windows')
+        shell: bash
         run: |
-          cargo xwin build --release \
+          set -euo pipefail
+          cargo zigbuild --release \
             --target ${{ matrix.rust-target }} \
             --manifest-path relay-rust/Cargo.toml
 
-      - name: Build (cargo-xwin + -Z build-std, Windows 7)
-        if: matrix.builder == 'win7'
+      - name: Build (zigbuild + -Z build-std, win7)
+        if: matrix.builder == 'zigbuild-win7'
+        shell: bash
+        env:
+          RUSTFLAGS: "-L native=${{ github.workspace }}/relay-rust/.win7-shim/${{ matrix.rust-target }}"
         run: |
-          cargo +nightly xwin build -Z build-std \
-            --target ${{ matrix.rust-target }} \
+          set -euo pipefail
+          cargo +nightly zigbuild -Z build-std \
             --release \
+            --target ${{ matrix.rust-target }} \
             --manifest-path relay-rust/Cargo.toml
 
       - name: Build (universal2 via lipo)
@@ -513,6 +574,12 @@ jobs:
 
           cp "$BIN" "dist/$DIR/${{ matrix.binary }}"
           cp apk/app-release.apk "dist/$DIR/gnirehtet.apk"
+
+          # Windows 7: include the synchronization shim DLL alongside the binary
+          if [ "${{ matrix.builder }}" = "zigbuild-win7" ]; then
+            cp shim-src/api-ms-win-core-synch-l1-2-0.dll "dist/$DIR/"
+          fi
+
           cd dist
           zip -r "$DIR.zip" "$DIR"
 
