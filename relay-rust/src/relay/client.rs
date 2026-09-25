@@ -21,7 +21,6 @@
 use log::*;
 use std::cell::RefCell;
 use std::io::{self, Cursor, Read, Write};
-use std::mem;
 use std::net::TcpStream;
 use std::rc::Rc;
 use std::time::Duration;
@@ -30,38 +29,60 @@ use super::close_listener::CloseListener;
 use super::ip_packet::IpPacket;
 use super::ip_packet_buffer::IpPacketBuffer;
 use super::ipv4_packet::MAX_PACKET_LENGTH;
-use super::packet_source::PacketSource;
 use super::router::Router;
 use super::stream_buffer::StreamBuffer;
 
 const TAG: &str = "Client";
 
+/// Shared outgoing buffer. Connections hold a clone of this `Rc` so they can
+/// write packets back to the device without borrowing the whole `Client`
+/// (which would panic since the main relay loop already holds a mutable
+/// borrow of the client while polling connections).
+pub type SharedBuffer = Rc<RefCell<StreamBuffer>>;
+
 pub struct Client {
     #[allow(dead_code)]
     id: u32,
+    #[allow(dead_code)]
+    serial: Option<String>,
+    /// Human-readable label used in log messages. Format: `#N (serial)`
+    /// or `#N` when the serial is not known.
+    #[allow(dead_code)]
+    label: String,
     client_to_network: IpPacketBuffer,
-    network_to_client: StreamBuffer,
+    network_to_client: SharedBuffer,
     router: Router,
     closed: bool,
     close_listener: Box<dyn CloseListener<Client>>,
-    pending_packet_sources: Vec<Rc<RefCell<dyn PacketSource>>>,
 }
 
-/// Channel for connections to send back data immediately to the client
-pub struct ClientChannel<'a> {
-    network_to_client: &'a mut StreamBuffer,
+/// Channel for connections to send back data immediately to the client.
+///
+/// It holds a clone of the shared buffer `Rc`; no lifetime is required
+/// because the `Rc` keeps the buffer alive independently of the `Client`.
+pub struct ClientChannel {
+    buffer: SharedBuffer,
 }
 
-impl<'a> ClientChannel<'a> {
-    fn new(network_to_client: &'a mut StreamBuffer) -> Self {
-        Self { network_to_client }
+impl ClientChannel {
+    pub fn new(buffer: SharedBuffer) -> Self {
+        Self { buffer }
     }
 
     /// Write an IP packet into the outgoing buffer to the device.
-    /// Returns `WouldBlock` if the buffer is full.
+    /// Returns `WouldBlock` if the buffer is full or currently borrowed.
     pub fn send_to_client(&mut self, ip_packet: &IpPacket) -> io::Result<()> {
-        if ip_packet.length() as usize <= self.network_to_client.remaining() {
-            self.network_to_client.read_from(ip_packet.raw());
+        let mut buffer = match self.buffer.try_borrow_mut() {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "client buffer busy",
+                ));
+            }
+        };
+        if ip_packet.length() as usize <= buffer.remaining() {
+            buffer.read_from(ip_packet.raw());
             Ok(())
         } else {
             warn!(target: TAG, "Client buffer full");
@@ -73,16 +94,30 @@ impl<'a> ClientChannel<'a> {
 impl Client {
     pub fn create(
         id: u32,
+        serial: Option<String>,
         close_listener: Box<dyn CloseListener<Client>>,
     ) -> io::Result<Rc<RefCell<Self>>> {
+        let label = match &serial {
+            Some(s) => format!("#{} ({})", id, s),
+            None => format!("#{}", id),
+        };
+
+        let buffer: SharedBuffer =
+            Rc::new(RefCell::new(StreamBuffer::new(16 * MAX_PACKET_LENGTH)));
+        
+        let mut router = Router::new();
+        router.set_buffer(buffer.clone());
+        router.set_client_label(&label);
+
         let rc = Rc::new(RefCell::new(Self {
             id,
+            serial,
+            label,
             client_to_network: IpPacketBuffer::new(),
-            network_to_client: StreamBuffer::new(16 * MAX_PACKET_LENGTH),
-            router: Router::new(),
+            network_to_client: buffer,
+            router,
             closed: false,
             close_listener,
-            pending_packet_sources: Vec::new(),
         }));
 
         {
@@ -106,29 +141,34 @@ impl Client {
         &mut self.router
     }
 
-    pub fn channel(&mut self) -> ClientChannel<'_> {
-        ClientChannel::new(&mut self.network_to_client)
+    /// Return a channel that connections can use to write back to the device.
+    pub fn channel(&mut self) -> ClientChannel {
+        ClientChannel::new(self.network_to_client.clone())
     }
 
     fn close(&mut self) {
         self.closed = true;
         self.router.clear();
-        self.pending_packet_sources.clear();
         self.close_listener.on_closed(self);
     }
 
     pub fn send_to_client(&mut self, ip_packet: &IpPacket) -> io::Result<()> {
-        if ip_packet.length() as usize <= self.network_to_client.remaining() {
-            self.network_to_client.read_from(ip_packet.raw());
+        let mut buffer = match self.network_to_client.try_borrow_mut() {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "client buffer busy",
+                ));
+            }
+        };
+        if ip_packet.length() as usize <= buffer.remaining() {
+            buffer.read_from(ip_packet.raw());
             Ok(())
         } else {
             warn!(target: TAG, "Client buffer full");
             Err(io::Error::new(io::ErrorKind::WouldBlock, "Client buffer full"))
         }
-    }
-
-    pub fn register_pending_packet_source(&mut self, source: Rc<RefCell<dyn PacketSource>>) {
-        self.pending_packet_sources.push(source);
     }
 
     pub fn clean_expired_connections(&mut self) {
@@ -140,9 +180,13 @@ impl Client {
     pub fn feed_device_data(&mut self, data: &[u8]) -> usize {
         let mut count = 0;
         let mut cursor = Cursor::new(data);
-        if self.client_to_network.read_from(&mut cursor).unwrap_or(false) {
+        if self
+            .client_to_network
+            .read_from(&mut cursor)
+            .unwrap_or(false)
+        {
             while let Some(packet) = self.client_to_network.as_ip_packet() {
-                let mut channel = ClientChannel::new(&mut self.network_to_client);
+                let mut channel = ClientChannel::new(self.network_to_client.clone());
                 self.router.send_to_network(&mut channel, &packet);
                 self.client_to_network.next();
                 count += 1;
@@ -152,64 +196,43 @@ impl Client {
     }
 
     /// Poll all network connections (TCP/UDP) for incoming/outgoing data.
+    ///
+    /// The `RefCell` on the shared buffer is *not* borrowed during this
+    /// call, so any connection polled here may freely write back to the
+    /// device by borrowing its own clone of the buffer.
     pub fn poll_network_connections(&mut self) {
         self.router.poll_connections();
     }
 
-    /// Process pending packet sources (deferred packets that couldn't be sent before).
-    pub fn process_pending(&mut self) {
-        let mut vec = Vec::new();
-        mem::swap(&mut self.pending_packet_sources, &mut vec);
-        for pending in vec.into_iter() {
-            let consumed = {
-                let mut source = pending.borrow_mut();
-                let result = match source.get() {
-                    Some(ip_packet) => self.send_to_client(&ip_packet),
-                    None => {
-                        warn!(target: TAG, "Pending packet source had no packet");
-                        continue;
-                    }
-                };
-                match result {
-                    Ok(_) => {
-                        source.next();
-                        true
-                    }
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => false,
-                    Err(err) => {
-                        error!(target: TAG, "Cannot send packet to client: {}", err);
-                        false
-                    }
-                }
-            };
-            if !consumed {
-                self.pending_packet_sources.push(pending);
-            }
-        }
-    }
-
     /// Drain the outgoing buffer into a Vec for writing to the stream.
     pub fn drain_outgoing(&mut self) -> Vec<u8> {
-        let size = self.network_to_client.size();
+        let mut buffer = match self.network_to_client.try_borrow_mut() {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        };
+        let size = buffer.size();
         if size == 0 {
             return Vec::new();
         }
         let mut buf = vec![0u8; size];
         let mut cursor = Cursor::new(&mut buf[..]);
-        let _ = self.network_to_client.write_to(&mut cursor);
+        let _ = buffer.write_to(&mut cursor);
         buf
     }
 
     /// Returns true if there is data to send to the device.
     #[allow(dead_code)]
     pub fn has_outgoing(&self) -> bool {
-        !self.network_to_client.is_empty()
+        match self.network_to_client.try_borrow() {
+            Ok(b) => !b.is_empty(),
+            Err(_) => false,
+        }
     }
 
     /// Entry point for a client connection. Uses blocking I/O on the TCP stream
     /// (converted from tokio accept) and runs the sync relay loop.
     /// Spawned onto a dedicated OS thread so the main async accept loop is not blocked.
-    pub fn run_blocking(tcp_stream: TcpStream) {
+    pub fn run_blocking(tcp_stream: TcpStream, serial: Option<String>) {
         let mut stream = tcp_stream;
         if let Err(e) = stream.set_nonblocking(true) {
             error!(target: TAG, "Failed to set non-blocking: {}", e);
@@ -219,12 +242,19 @@ impl Client {
         // Assign client ID and send it to the device first (device expects relay to write first)
         static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
+        // Human-readable label used in log messages. Includes the ADB serial
+        // when the relay was able to correlate this connection with a device.
+        let label = match &serial {
+            Some(s) => format!("#{} ({})", id, s),
+            None => format!("#{}", id),
+        };
         let id_bytes = id.to_be_bytes();
         if write_all(&mut stream, &id_bytes).is_err() {
             error!(target: TAG, "Failed to write client ID");
             return;
         }
-        info!(target: TAG, "Client #{} connected", id);
+        info!(target: TAG, "Client {} connected", label);
 
         let close_tx = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let close_rx = close_tx.clone();
@@ -233,7 +263,7 @@ impl Client {
             close_tx.store(true, std::sync::atomic::Ordering::SeqCst);
         }) as Box<dyn CloseListener<Client>>;
 
-        let client_rc = match Self::create(id, close_listener) {
+        let client_rc = match Self::create(id, serial.clone(), close_listener) {
             Ok(c) => c,
             Err(e) => {
                 error!(target: TAG, "Failed to create client state: {}", e);
@@ -256,7 +286,7 @@ impl Client {
 
             match stream.read(&mut read_buf) {
                 Ok(0) => {
-                    debug!(target: TAG, "Client #{} EOF received", id);
+                    debug!(target: TAG, "Client {} EOF received", label);
                     client.close();
                     break;
                 }
@@ -267,7 +297,7 @@ impl Client {
                 }
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => {
-                    error!(target: TAG, "Client #{} read error: {}", id, e);
+                    error!(target: TAG, "Client {} read error: {}", label, e);
                     client.close();
                     break;
                 }
@@ -276,7 +306,6 @@ impl Client {
             // Poll network connections
             if !client.closed {
                 client.poll_network_connections();
-                client.process_pending();
             }
 
             // Periodic cleanup
@@ -293,7 +322,7 @@ impl Client {
             if !outgoing.is_empty() {
                 made_progress = true;
                 if write_all(&mut stream, &outgoing).is_err() {
-                    error!(target: TAG, "Client #{} write error", id);
+                    error!(target: TAG, "Client {} write error", label);
                     break;
                 }
             }
@@ -303,7 +332,7 @@ impl Client {
             }
         }
 
-        info!(target: TAG, "Client #{} disconnected", id);
+        info!(target: TAG, "Client {} disconnected", label);
     }
 }
 

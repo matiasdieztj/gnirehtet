@@ -14,12 +14,11 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use super::binary;
-use super::client::{Client, ClientChannel};
+use super::client::{Client, ClientChannel, SharedBuffer};
 use super::connection::{Connection, ConnectionId};
 use super::ip_header::IpHeader;
 use super::ip_packet::IpPacket;
 use super::ipv4_packet::MAX_PACKET_LENGTH;
-use super::packet_source::PacketSource;
 use super::packetizer::Packetizer;
 use super::stream_buffer::StreamBuffer;
 use super::tcp_header::{self, TcpHeader, TcpHeaderMut};
@@ -40,12 +39,18 @@ pub static mut GLOBAL_BYTES_SENT: u64 = 0;
 pub static mut GLOBAL_BYTES_RECEIVED: u64 = 0;
 
 pub struct TcpConnection {
+    #[allow(dead_code)]
     self_weak: Weak<RefCell<TcpConnection>>,
     id: ConnectionId,
     client: Weak<RefCell<Client>>,
+    /// Shared outgoing buffer. Writing here goes straight to the device
+    /// without needing to borrow the `Client`.
+    buffer: SharedBuffer,
     stream: TcpStream,
     client_to_network: StreamBuffer,
     network_to_client: Packetizer,
+    /// Length of a packet that could not be written to the buffer yet
+    /// (because the buffer was full). It is retried on each poll.
     packet_for_client_length: Option<u16>,
     closed: bool,
     tcb: Tcb,
@@ -79,7 +84,10 @@ enum TcpState {
 impl TcpState {
     #[inline]
     fn is_connected(&self) -> bool {
-        !matches!(self, TcpState::Init | TcpState::SynSent | TcpState::SynReceived)
+        !matches!(
+            self,
+            TcpState::Init | TcpState::SynSent | TcpState::SynReceived
+        )
     }
 
     #[inline]
@@ -126,11 +134,45 @@ impl Tcb {
     }
 }
 
+/// Build the SOCKS5 CONNECT request (RFC 1928 §4) for the given destination.
+///
+/// The request layout is:
+/// ```text
+///   +----+-----+-------+------+----------+----------+
+///   |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+///   +----+-----+-------+------+----------+----------+
+///   | 1  |  1  | X'00' |  1   | Variable |    2     |
+///   +----+-----+-------+------+----------+----------+
+/// ```
+///
+/// `ATYP` must match the destination address family:
+///   * `0x01` — IPv4 (4-byte address)
+///   * `0x04` — IPv6 (16-byte address)
+///
+/// `DST.PORT` is always 2 bytes, big-endian.
+fn build_socks5_connect_request(destination: &std::net::SocketAddr) -> Vec<u8> {
+    let port_be = destination.port().to_be_bytes();
+    let mut request = vec![0x05, 0x01, 0x00]; // VER=5, CMD=CONNECT, RSV=0
+    match destination.ip() {
+        std::net::IpAddr::V4(ip) => {
+            request.push(0x01); // ATYP = IPv4
+            request.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            request.push(0x04); // ATYP = IPv6
+            request.extend_from_slice(&ip.octets());
+        }
+    }
+    request.extend_from_slice(&port_be);
+    request
+}
+
 impl TcpConnection {
     #[allow(clippy::needless_pass_by_value)] // semantically, headers are consumed
     pub fn create(
         id: ConnectionId,
         client: Weak<RefCell<Client>>,
+        buffer: SharedBuffer,
         ip_header: IpHeader,
         transport_header: TransportHeader,
     ) -> io::Result<Rc<RefCell<Self>>> {
@@ -139,7 +181,7 @@ impl TcpConnection {
 
         let tcp_header = Self::tcp_header_of_transport(transport_header);
 
-        // shrink the TCP options to pass a minimal refrence header to the packetizer
+        // shrink the TCP options to pass a minimal reference header to the packetizer
         let mut shrinked_tcp_header_raw = [0u8; 20];
         shrinked_tcp_header_raw.copy_from_slice(&tcp_header.raw()[..20]);
         let mut shrinked_tcp_header_data = tcp_header.data().clone();
@@ -160,6 +202,7 @@ impl TcpConnection {
             self_weak: Weak::new(),
             id,
             client,
+            buffer,
             stream,
             client_to_network: StreamBuffer::new(4 * MAX_PACKET_LENGTH),
             network_to_client: packetizer,
@@ -214,37 +257,40 @@ impl TcpConnection {
     }
 
     /// Connect to a destination through a SOCKS5 proxy.
-    fn connect_via_socks5(proxy: &std::net::SocketAddr, destination: &std::net::SocketAddr) -> io::Result<TcpStream> {
+    fn connect_via_socks5(
+        proxy: &std::net::SocketAddr,
+        destination: &std::net::SocketAddr,
+    ) -> io::Result<TcpStream> {
         use std::io::{Read, Write};
         let mut stream = TcpStream::connect(proxy)?;
         stream.set_nonblocking(false)?;
 
+        // Step 1: method negotiation. We only advertise "no authentication".
         let greeting = [0x05, 0x01, 0x00];
         stream.write_all(&greeting)?;
 
         let mut response = [0u8; 2];
         stream.read_exact(&mut response)?;
         if response != [0x05, 0x00] {
-            return Err(io::Error::other(
-                format!("SOCKS5 handshake failed: expected [0x05, 0x00], got {:?}", response)));
+            return Err(io::Error::other(format!(
+                "SOCKS5 handshake failed: expected [0x05, 0x00], got {:?}",
+                response
+            )));
         }
 
-        let ip_bytes = match destination.ip() {
-            std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
-            std::net::IpAddr::V6(_ip) => return Err(io::Error::new(io::ErrorKind::Unsupported,
-                "SOCKS5 proxy does not support IPv6 destinations")),
-        };
-        let port_be = destination.port().to_be_bytes();
-        let mut connect_request = vec![0x05, 0x01, 0x00, 0x01];
-        connect_request.extend_from_slice(&ip_bytes);
-        connect_request.extend_from_slice(&port_be);
+        // Step 2: send the CONNECT request. ATYP depends on the destination
+        // address family (IPv4 → 0x01, IPv6 → 0x04).
+        let connect_request = build_socks5_connect_request(destination);
         stream.write_all(&connect_request)?;
 
+        // Step 3: parse the reply.
         let mut reply = [0u8; 4];
         stream.read_exact(&mut reply)?;
         if reply[0] != 0x05 || reply[1] != 0x00 {
-            return Err(io::Error::other(
-                format!("SOCKS5 connect failed: reply={:?}", reply)));
+            return Err(io::Error::other(format!(
+                "SOCKS5 connect failed: reply={:?}",
+                reply
+            )));
         }
         let addr_type = reply[3];
         let remaining_len = match addr_type {
@@ -255,8 +301,12 @@ impl TcpConnection {
                 len_byte[0] as usize + 1 + 2
             }
             0x04 => 16 + 2,
-            _ => return Err(io::Error::other(
-                format!("SOCKS5 unknown address type: {}", addr_type))),
+            _ => {
+                return Err(io::Error::other(format!(
+                    "SOCKS5 unknown address type: {}",
+                    addr_type
+                )));
+            }
         };
         if remaining_len > 0 {
             let mut rest = vec![0u8; remaining_len];
@@ -268,7 +318,10 @@ impl TcpConnection {
     }
 
     fn remove_from_router(&self) {
-        let client_rc = self.client.upgrade().unwrap_or_else(|| panic!("Expected client not found"));
+        let client_rc = self
+            .client
+            .upgrade()
+            .unwrap_or_else(|| panic!("Expected client not found"));
         let mut client = match client_rc.try_borrow_mut() {
             Ok(c) => c,
             Err(_) => {
@@ -279,6 +332,59 @@ impl TcpConnection {
         client.router().remove(&self.id);
     }
 
+    /// Write an IP packet into the shared buffer.
+    ///
+    /// This is intentionally an associated function rather than a `&self`
+    /// method: the callers frequently hold a mutable borrow of
+    /// `self.network_to_client` (through the `IpPacket` returned by the
+    /// packetizer), and a `&self` method would conflict with it. Taking
+    /// `&SharedBuffer` explicitly restricts the borrow to the `buffer` field,
+    /// which is disjoint from `network_to_client` and therefore accepted by
+    /// the borrow checker.
+    fn send_packet_to_buffer(buffer: &SharedBuffer, ip_packet: &IpPacket) -> io::Result<()> {
+        let mut buf = match buffer.try_borrow_mut() {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "client buffer busy",
+                ));
+            }
+        };
+        if ip_packet.length() as usize <= buf.remaining() {
+            buf.read_from(ip_packet.raw());
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "client buffer full"))
+        }
+    }
+
+    /// Retry flushing the deferred packet (if any). Called at the top of
+    /// `poll_self()` before anything else, so that a packet deferred on a
+    /// previous iteration is not stuck forever.
+    fn flush_pending_packet(&mut self) -> io::Result<()> {
+        let len = match self.packet_for_client_length {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let ip_packet = self.network_to_client.inflate(len);
+        match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
+            Ok(()) => {
+                self.tcb.sequence_number += Wrapping(u32::from(len));
+                self.packet_for_client_length = None;
+                cx_debug!(
+                    target: TAG,
+                    self.id,
+                    "Deferred packet flushed ({} bytes) {}",
+                    len,
+                    self.tcb.numbers()
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Poll the connection: try to send/receive on the network socket.
     fn poll_self(&mut self) -> io::Result<()> {
         if self.closed {
@@ -286,6 +392,21 @@ impl TcpConnection {
         }
 
         let mut made_progress = false;
+
+        // First, retry a previously deferred packet (if any). If it still
+        // cannot be flushed, stop here and try again on the next iteration.
+        if self.packet_for_client_length.is_some() {
+            match self.flush_pending_packet() {
+                Ok(()) => made_progress = true,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "pending packet still cannot be flushed",
+                    ));
+                }
+                Err(err) => return Err(err),
+            }
+        }
 
         if self.may_write() {
             match self.process_send() {
@@ -368,22 +489,12 @@ impl TcpConnection {
                     self.tcb.acknowledgement_number += Wrapping(w as u32);
 
                     if self.tcb.fin_received && self.client_to_network.is_empty() {
-                        let Some(client_rc) = self.client.upgrade() else {
-                            return Ok(());
-                        };
-                        let mut client = match client_rc.try_borrow_mut() {
-                            Ok(c) => c,
-                            Err(_) => {
-                                cx_debug!(target: TAG, self.id, "Client busy, skipping");
-                                return Ok(());
-                            }
-                        };
                         cx_debug!(
                             target: TAG,
                             self.id,
                             "No more pending data, process the pending FIN"
                         );
-                        self.do_handle_fin(&mut client.channel());
+                        self.do_handle_fin();
                     } else {
                         cx_debug!(
                             target: TAG,
@@ -418,7 +529,7 @@ impl TcpConnection {
     fn process_receive(&mut self) -> io::Result<()> {
         debug_assert!(
             self.packet_for_client_length.is_none(),
-            "A pending packet was not sent"
+            "A pending packet was not flushed"
         );
         let remaining_client_window = self.tcb.remaining_client_window();
         debug_assert!(
@@ -438,8 +549,8 @@ impl TcpConnection {
         {
             Ok(Some(ip_packet)) => {
                 self.bytes_received += ip_packet.payload().map(|p| p.len() as u64).unwrap_or(0);
-                match Self::send_to_client(&self.client, &ip_packet) {
-                    Ok(_) => {
+                match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
+                    Ok(()) => {
                         let len = ip_packet.payload().unwrap().len();
                         cx_debug!(
                             target: TAG,
@@ -451,20 +562,12 @@ impl TcpConnection {
                         self.tcb.sequence_number += Wrapping(len as u32);
                     }
                     Err(_) => {
-                        let client_rc = match self.client.upgrade() {
-                            Some(c) => c,
-                            None => {
-                                warn!(target: TAG, "Client already dropped, closing stale connection");
-                                self.close();
-                                return Ok(());
-                            }
-                        };
-                        let mut client = match client_rc.try_borrow_mut() {
-                            Ok(c) => c,
-                            Err(_) => return Ok(()),
-                        };
-                        let self_rc = self.self_weak.upgrade().unwrap();
-                        client.register_pending_packet_source(self_rc);
+                        cx_debug!(
+                            target: TAG,
+                            self.id,
+                            "Client buffer unavailable, deferring packet ({} bytes)",
+                            ip_packet.length()
+                        );
                         self.packet_for_client_length = Some(ip_packet.length());
                     }
                 };
@@ -498,69 +601,40 @@ impl TcpConnection {
         self.tcb.sequence_number += Wrapping(1);
     }
 
-    fn send_to_client(
-        client: &Weak<RefCell<Client>>,
-        ip_packet: &IpPacket,
-    ) -> io::Result<()> {
-        let client_rc = match client.upgrade() {
-            Some(c) => c,
-            None => return Err(io::Error::new(io::ErrorKind::NotConnected, "client dropped")),
-        };
-        let mut client = client_rc.try_borrow_mut().map_err(|_| {
-            io::Error::new(io::ErrorKind::WouldBlock, "client busy")
-        })?;
-        client.send_to_client(ip_packet)
-    }
-
-    /// Send empty packet with the given flags to the client.
+    /// Send empty packet with the given flags to the client, writing directly
+    /// into the shared buffer. No `Client` borrow is performed, so this is safe
+    /// to call from within `poll_self()`.
     fn send_empty_packet_to_client(&mut self, flags: u16) {
-        let client_rc = match self.client.upgrade() {
-            Some(c) => c,
-            None => {
-                warn!(target: TAG, "Client already dropped, closing stale connection");
-                self.close();
-                return;
+        let ip_packet = Self::create_empty_response_packet(
+            &self.id,
+            &mut self.network_to_client,
+            &self.tcb,
+            flags,
+        );
+        match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
+            Ok(()) => {
+                cx_debug!(
+                    target: TAG,
+                    self.id,
+                    "Control packet (flags={}) sent to client",
+                    flags
+                );
             }
-        };
-        if let Ok(mut client) = client_rc.try_borrow_mut() {
-            if !client.is_closed() {
-                self.reply_empty_packet_to_client(&mut client.channel(), flags);
+            Err(_) => {
+                cx_debug!(
+                    target: TAG,
+                    self.id,
+                    "Buffer unavailable, skipping control packet (flags={})",
+                    flags
+                );
             }
-        } else {
-            // Client is busy (already borrowed by the router) — skip the empty packet
-            cx_debug!(target: TAG, self.id, "Client busy, skipping control packet");
         }
     }
 
-    fn reply_empty_packet_to_client(
-        &mut self,
-        client_channel: &mut ClientChannel,
-        flags: u16,
-    ) {
-        let ip_packet =
-            Self::create_empty_response_packet(&self.id, &mut self.network_to_client, &self.tcb, flags);
-        let _ = client_channel.send_to_client(&ip_packet);
-    }
-
     fn eof(&mut self) {
-        let client_rc = match self.client.upgrade() {
-            Some(c) => c,
-            None => {
-                warn!(target: TAG, "Client already dropped, closing stale connection");
-                self.close();
-                return;
-            }
-        };
-        let mut client = match client_rc.try_borrow_mut() {
-            Ok(c) => c,
-            Err(_) => {
-                cx_debug!(target: TAG, self.id, "Client busy, skipping EOF");
-                return;
-            }
-        };
         cx_debug!(target: TAG, self.id, "EOF");
         self.tcb.acknowledgement_number += Wrapping(1); // FIN counts for 1 byte
-        self.reply_empty_packet_to_client(&mut client.channel(), tcp_header::FLAG_FIN | tcp_header::FLAG_ACK);
+        self.send_empty_packet_to_client(tcp_header::FLAG_FIN | tcp_header::FLAG_ACK);
         self.tcb.fin_sequence_number = Some(self.tcb.sequence_number.0);
         self.tcb.sequence_number += Wrapping(1); // FIN counts for 1 byte
         self.tcb.state = TcpState::FinWait1;
@@ -600,11 +674,7 @@ impl TcpConnection {
         tcp_header.set_flags(flags);
     }
 
-    fn handle_packet(
-        &mut self,
-        client_channel: &mut ClientChannel,
-        ip_packet: &IpPacket,
-    ) {
+    fn handle_packet(&mut self, client_channel: &mut ClientChannel, ip_packet: &IpPacket) {
         let tcp_header = Self::tcp_header_of_packet(ip_packet);
         if self.tcb.state == TcpState::Init {
             self.handle_first_packet(client_channel, ip_packet);
@@ -663,17 +733,14 @@ impl TcpConnection {
         }
 
         if let Some(fin_sequence_number) = self.tcb.fin_sequence_number
-            && tcp_header.acknowledgement_number() == fin_sequence_number + 1 {
-                cx_debug!(target: TAG, self.id, "Received ACK of FIN");
-                self.handle_fin_ack();
-            }
+            && tcp_header.acknowledgement_number() == fin_sequence_number + 1
+        {
+            cx_debug!(target: TAG, self.id, "Received ACK of FIN");
+            self.handle_fin_ack();
+        }
     }
 
-    fn handle_first_packet(
-        &mut self,
-        client_channel: &mut ClientChannel,
-        ip_packet: &IpPacket,
-    ) {
+    fn handle_first_packet(&mut self, client_channel: &mut ClientChannel, ip_packet: &IpPacket) {
         cx_debug!(target: TAG, self.id, "handle_first_packet()");
         let tcp_header = Self::tcp_header_of_packet(ip_packet);
         if tcp_header.is_syn() {
@@ -723,7 +790,7 @@ impl TcpConnection {
         }
     }
 
-    fn handle_fin(&mut self, client_channel: &mut ClientChannel) {
+    fn handle_fin(&mut self, _client_channel: &mut ClientChannel) {
         cx_debug!(
             target: TAG,
             self.id,
@@ -738,28 +805,25 @@ impl TcpConnection {
                 self.id,
                 "No pending data, process the FIN immediately"
             );
-            self.do_handle_fin(client_channel);
+            self.do_handle_fin();
         }
     }
 
-    fn do_handle_fin(&mut self, client_channel: &mut ClientChannel) {
+    fn do_handle_fin(&mut self) {
         self.tcb.acknowledgement_number += Wrapping(1); // received FIN counts for 1 byte
 
         if self.tcb.state == TcpState::Established {
-            self.reply_empty_packet_to_client(
-                client_channel,
-                tcp_header::FLAG_FIN | tcp_header::FLAG_ACK,
-            );
+            self.send_empty_packet_to_client(tcp_header::FLAG_FIN | tcp_header::FLAG_ACK);
             self.tcb.fin_sequence_number = Some(self.tcb.sequence_number.0);
             self.tcb.sequence_number += Wrapping(1);
             self.tcb.state = TcpState::LastAck;
             cx_debug!(target: TAG, self.id, "State = {:?}", self.tcb.state);
         } else if self.tcb.state == TcpState::FinWait1 {
-            self.reply_empty_packet_to_client(client_channel, tcp_header::FLAG_ACK);
+            self.send_empty_packet_to_client(tcp_header::FLAG_ACK);
             self.tcb.state = TcpState::Closing;
             cx_debug!(target: TAG, self.id, "State = {:?}", self.tcb.state);
         } else if self.tcb.state == TcpState::FinWait2 {
-            self.reply_empty_packet_to_client(client_channel, tcp_header::FLAG_ACK);
+            self.send_empty_packet_to_client(tcp_header::FLAG_ACK);
             self.close();
         } else {
             cx_warn!(
@@ -787,11 +851,7 @@ impl TcpConnection {
         }
     }
 
-    fn handle_ack(
-        &mut self,
-        _client_channel: &mut ClientChannel,
-        ip_packet: &IpPacket,
-    ) {
+    fn handle_ack(&mut self, _client_channel: &mut ClientChannel, ip_packet: &IpPacket) {
         cx_debug!(target: TAG, self.id, "handle_ack()");
         if self.tcb.state == TcpState::SynReceived {
             self.tcb.state = TcpState::Established;
@@ -822,6 +882,18 @@ impl TcpConnection {
         }
 
         self.client_to_network.read_from(payload);
+    }
+
+    /// Reply through an explicit `ClientChannel` (used only when the packet
+    /// arrives from the device, i.e. when no buffer borrow conflict exists).
+    fn reply_empty_packet_to_client(&mut self, client_channel: &mut ClientChannel, flags: u16) {
+        let ip_packet = Self::create_empty_response_packet(
+            &self.id,
+            &mut self.network_to_client,
+            &self.tcb,
+            flags,
+        );
+        let _ = client_channel.send_to_client(&ip_packet);
     }
 
     fn create_empty_response_packet<'a>(
@@ -873,11 +945,7 @@ impl Connection for TcpConnection {
         &self.id
     }
 
-    fn send_to_network(
-        &mut self,
-        client_channel: &mut ClientChannel,
-        ip_packet: &IpPacket,
-    ) {
+    fn send_to_network(&mut self, client_channel: &mut ClientChannel, ip_packet: &IpPacket) {
         self.handle_packet(client_channel, ip_packet);
     }
 
@@ -899,31 +967,60 @@ impl Connection for TcpConnection {
     }
 }
 
-impl PacketSource for TcpConnection {
-    fn get(&mut self) -> Option<IpPacket<'_>> {
-        if let Some(len) = self.packet_for_client_length {
-            Some(self.network_to_client.inflate(len))
-        } else {
-            None
-        }
+#[cfg(test)]
+mod tests {
+    use super::build_socks5_connect_request;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn socks5_request_ipv4_layout() {
+        let dest: SocketAddr = (Ipv4Addr::new(8, 8, 8, 8), 443).into();
+        let req = build_socks5_connect_request(&dest);
+        assert_eq!(req, vec![0x05, 0x01, 0x00, 0x01, 8, 8, 8, 8, 0x01, 0xBB]);
     }
 
-    fn next(&mut self) {
-        let len = match self.packet_for_client_length {
-            Some(l) => l,
-            None => {
-                error!(target: TAG, "next() called with no pending packet");
-                return;
-            }
-        };
-        cx_debug!(
-            target: TAG,
-            self.id,
-            "Deferred packet ({} bytes) sent to client {}",
-            len,
-            self.tcb.numbers()
-        );
-        self.tcb.sequence_number += Wrapping(u32::from(len));
-        self.packet_for_client_length = None;
+    #[test]
+    fn socks5_request_ipv6_layout() {
+        let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dest: SocketAddr = (addr, 443).into();
+        let req = build_socks5_connect_request(&dest);
+        let mut expected = vec![0x05, 0x01, 0x00, 0x04];
+        expected.extend_from_slice(&addr.octets());
+        expected.extend_from_slice(&[0x01, 0xBB]);
+        assert_eq!(req, expected);
+    }
+
+    #[test]
+    fn socks5_request_ipv4_length() {
+        let dest: SocketAddr = (Ipv4Addr::new(1, 1, 1, 1), 53).into();
+        assert_eq!(build_socks5_connect_request(&dest).len(), 10);
+    }
+
+    #[test]
+    fn socks5_request_ipv6_length() {
+        let dest: SocketAddr = (Ipv6Addr::LOCALHOST, 53).into();
+        assert_eq!(build_socks5_connect_request(&dest).len(), 22);
+    }
+
+    #[test]
+    fn socks5_request_port_is_big_endian() {
+        let dest: SocketAddr = (Ipv4Addr::new(1, 2, 3, 4), 0x1234).into();
+        let req = build_socks5_connect_request(&dest);
+        assert_eq!(&req[req.len() - 2..], &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn socks5_request_ipv6_port_is_big_endian() {
+        let dest: SocketAddr = (Ipv6Addr::LOCALHOST, 0xABCD).into();
+        let req = build_socks5_connect_request(&dest);
+        assert_eq!(&req[req.len() - 2..], &[0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn socks5_request_rejects_nothing() {
+        let v4: SocketAddr = (Ipv4Addr::UNSPECIFIED, 1).into();
+        let v6: SocketAddr = (Ipv6Addr::UNSPECIFIED, 1).into();
+        assert_eq!(build_socks5_connect_request(&v4)[3], 0x01);
+        assert_eq!(build_socks5_connect_request(&v6)[3], 0x04);
     }
 }

@@ -26,8 +26,8 @@ cargo test --manifest-path relay-rust\Cargo.toml
 goto end
 
 :apk
-echo Building APK...
-call gradlew.bat :app:assembleDebug
+echo Building release APK...
+call gradlew.bat :app:assembleRelease
 goto end
 
 :clean
@@ -41,7 +41,7 @@ echo Usage: build.bat [build^|run^|test^|apk^|clean]
 echo   build  - Build the release binary
 echo   run    - Build and run gnirehtet
 echo   test   - Run all tests
-echo   apk    - Build the Android APK
+echo   apk    - Build the release Android APK (debug-signed)
 echo   clean  - Clean build artifacts
 goto end
 

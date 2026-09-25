@@ -7,44 +7,20 @@ on:
 permissions:
   contents: write
 
-jobs:
-  build:
-    strategy:
-      matrix:
-        target:
-          - os: ubuntu-latest
-            rust-target: x86_64-unknown-linux-gnu
-            archive-suffix: linux64
-            binary: gnirehtet
-          - os: ubuntu-latest
-            rust-target: aarch64-unknown-linux-gnu
-            archive-suffix: linux-arm64
-            binary: gnirehtet
-          - os: macos-latest
-            rust-target: x86_64-apple-darwin
-            archive-suffix: macos64
-            binary: gnirehtet
-          - os: macos-latest
-            rust-target: aarch64-apple-darwin
-            archive-suffix: macos-arm64
-            binary: gnirehtet
-          - os: windows-latest
-            rust-target: x86_64-pc-windows-msvc
-            archive-suffix: win64
-            binary: gnirehtet.exe
-          - os: windows-latest
-            rust-target: aarch64-pc-windows-msvc
-            archive-suffix: win-arm64
-            binary: gnirehtet.exe
-    runs-on: ${{ matrix.target.os }}
+env:
+  CARGO_TERM_COLOR: always
 
+jobs:
+  # =====================================================================
+  # Job 1: Build the release APK once, signed with the built-in debug
+  # key. Every binary job below depends on this so the APK is only
+  # compiled once and distributed alongside each relay binary.
+  # =====================================================================
+  build-apk:
+    name: Build release APK (debug-signed)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target.rust-target }}
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -55,52 +31,536 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build APK
-        run: ./gradlew :app:assembleDebug
+      - name: Build release APK
+        run: ./gradlew :app:assembleRelease
 
-      - name: Install cross-linker (Linux ARM64)
-        if: matrix.target.rust-target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target.rust-target }} --manifest-path relay-rust/Cargo.toml
-
-      - name: Package
+      - name: Verify the APK is signed
         shell: bash
         run: |
-          ARCHIVE_DIR="gnirehtet-${{ matrix.target.archive-suffix }}"
-          mkdir -p "dist/$ARCHIVE_DIR"
-          cp "relay-rust/target/${{ matrix.target.rust-target }}/release/${{ matrix.target.binary }}" "dist/$ARCHIVE_DIR/gnirehtet$([[ "${{ matrix.target.os }}" == windows-* ]] && echo '.exe' || true)"
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/$ARCHIVE_DIR/gnirehtet.apk"
-          cd dist
-          if command -v 7z &>/dev/null; then
-            7z a -tzip "${ARCHIVE_DIR}.zip" "$ARCHIVE_DIR" > /dev/null
-          else
-            zip -r "${ARCHIVE_DIR}.zip" "$ARCHIVE_DIR"
+          set -euo pipefail
+          DIR=app/build/outputs/apk/release
+          if [ ! -f "$DIR/app-release.apk" ]; then
+            echo "::error::app-release.apk not found. Directory contents:"
+            ls -la "$DIR" || true
+            exit 1
           fi
+          if [ -f "$DIR/app-release-unsigned.apk" ]; then
+            echo "::error::APK was NOT signed. Check that 'signingConfig signingConfigs.debug' is set in app/build.gradle"
+            exit 1
+          fi
+          echo "OK: $DIR/app-release.apk is signed"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnirehtet-apk
+          path: app/build/outputs/apk/release/app-release.apk
+
+  # =====================================================================
+  # Job 2: Build the relay binary for every supported platform.
+  #
+  # The 'builder' field selects how the cross-compilation is performed:
+  #   native   — plain `cargo build` on the runner's native toolchain
+  #   zigbuild — `cargo zigbuild` (Zig as linker, no SDK needed)
+  #   cross    — `cross` (Docker containers with prebuilt toolchains)
+  #   xwin     — `cargo xwin` (MSVC libraries downloaded from Microsoft)
+  #   win7     — nightly + `-Z build-std` + cargo-xwin for Tier 3 win7
+  #   universal2 — build x86_64 + arm64 separately then `lipo` them
+  #
+  # Fields:
+  #   install-targets — what to pass to `rustup target add`. Defaults
+  #                     to `rust-target` if not set.
+  #   glibc           — appended to the target for cargo-zigbuild, e.g.
+  #                     `x86_64-unknown-linux-gnu.2.36`
+  #   experimental    — job is allowed to fail without blocking release
+  #
+  # ---------------------------------------------------------------------
+  # Caching strategy (three independent layers)
+  # ---------------------------------------------------------------------
+  #
+  # 1. sccache (SCCACHE_GHA_ENABLED) — caches compiled crates at the
+  #    crate level, shared across releases. Enabled for every builder
+  #    EXCEPT 'cross' (Docker containers cannot reach the host's
+  #    sccache socket). Biggest win on Windows 7 jobs, which recompile
+  #    the whole standard library via `-Z build-std`.
+  #
+  # 2. Cargo tools cache (~/.cargo/bin + ~/.cargo/registry) — caches
+  #    the compiled binaries of `cross`, `cargo-zigbuild`, `cargo-xwin`
+  #    and their dependency downloads. Saves 2-5 min per job on the
+  #    second run. Enabled for every builder including 'cross'.
+  #
+  # 3. Cargo target cache (relay-rust/target) — caches the full target
+  #    directory (fingerprints, build script outputs, proc-macro
+  #    artifacts). Keyed by runner OS + target triple + Cargo.lock
+  #    hash. Skipped for 'cross' because that builder writes the
+  #    target dir from inside the Docker container, where file
+  #    ownership may not match the runner's user.
+  #
+  # Cache quota: GitHub Actions enforces 10 GB per repository across
+  # ALL caches combined (including gradle/setup-gradle and sccache).
+  # If cache quota errors appear, in order of impact:
+  #   a. Bump SCCACHE_GHA_VERSION to reset the sccache backend.
+  #   b. Remove the target cache for one or two of the smaller jobs.
+  #   c. Remove the target cache entirely — sccache covers most of
+  #      its benefit for this project (no build.rs scripts).
+  # ---------------------------------------------------------------------
+  build:
+    name: ${{ matrix.name }}
+    needs: [build-apk]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # -----------------------------------------------------------------
+          # Linux — musl (static binaries, run on Debian 12 and Debian 13
+          # plus any other distro of the same architecture)
+          # -----------------------------------------------------------------
+          - name: linux-x86_64-musl
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-musl
+            builder: native-musl
+            suffix: linux-x86_64-musl
+            binary: gnirehtet
+
+          - name: linux-i686-musl
+            os: ubuntu-latest
+            rust-target: i686-unknown-linux-musl
+            builder: zigbuild
+            suffix: linux-i686-musl
+            binary: gnirehtet
+
+          - name: linux-aarch64-musl
+            os: ubuntu-latest
+            rust-target: aarch64-unknown-linux-musl
+            builder: cross
+            suffix: linux-aarch64-musl
+            binary: gnirehtet
+
+          - name: linux-armv7-musl
+            os: ubuntu-latest
+            rust-target: armv7-unknown-linux-musleabihf
+            builder: cross
+            suffix: linux-armv7-musl
+            binary: gnirehtet
+
+          # -----------------------------------------------------------------
+          # Linux — glibc, pinned to 2.36 so the binary runs on Debian 12
+          # (glibc 2.36) AND Debian 13 (glibc 2.41). Without the pin, a
+          # build on ubuntu-latest would require glibc 2.39+ and would
+          # NOT start on Debian 12.
+          # -----------------------------------------------------------------
+          - name: linux-x86_64-glibc
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            glibc: '2.36'
+            builder: zigbuild
+            suffix: linux-x86_64-glibc
+            binary: gnirehtet
+
+          - name: linux-aarch64-glibc
+            os: ubuntu-latest
+            rust-target: aarch64-unknown-linux-gnu
+            glibc: '2.36'
+            builder: zigbuild
+            suffix: linux-aarch64-glibc
+            binary: gnirehtet
+
+          # -----------------------------------------------------------------
+          # macOS
+          #   x86_64     → deployment target 10.12 Sierra (Rust's hard min)
+          #   aarch64    → deployment target 11.0  Big Sur  (Rust's hard min)
+          #   universal2 → fat binary via `lipo`
+          #
+          # Snow Leopard 10.6 is IMPOSSIBLE with modern Rust. The oldest
+          # supported target is 10.12 for x86_64 and 11.0 for arm64.
+          # -----------------------------------------------------------------
+          - name: macos-x86_64
+            os: macos-14
+            rust-target: x86_64-apple-darwin
+            deployment-target: '10.12'
+            builder: native
+            suffix: macos-x86_64
+            binary: gnirehtet
+
+          - name: macos-arm64
+            os: macos-14
+            rust-target: aarch64-apple-darwin
+            deployment-target: '11.0'
+            builder: native
+            suffix: macos-arm64
+            binary: gnirehtet
+
+          - name: macos-universal2
+            os: macos-14
+            rust-target: universal2-apple-darwin
+            install-targets: x86_64-apple-darwin,aarch64-apple-darwin
+            builder: universal2
+            suffix: macos-universal2
+            binary: gnirehtet
+
+          # -----------------------------------------------------------------
+          # Windows — Tier 1 targets (Windows 10+)
+          #   i686     → native on windows-latest
+          #   x86_64   → native on windows-latest
+          #   aarch64  → cargo-xwin on ubuntu-latest (GitHub runners have
+          #              no Windows ARM64 hardware and the x64 MSVC
+          #              toolchain cannot link ARM64)
+          # -----------------------------------------------------------------
+          - name: windows-i686
+            os: windows-latest
+            rust-target: i686-pc-windows-msvc
+            builder: native
+            suffix: windows-i686
+            binary: gnirehtet.exe
+
+          - name: windows-x86_64
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            builder: native
+            suffix: windows-x86_64
+            binary: gnirehtet.exe
+
+          - name: windows-arm64
+            os: ubuntu-latest
+            rust-target: aarch64-pc-windows-msvc
+            builder: xwin
+            suffix: windows-arm64
+            binary: gnirehtet.exe
+
+          # -----------------------------------------------------------------
+          # Windows — Tier 3 targets for Windows 7 and 8.1.
+          #
+          # These use nightly + `-Z build-std` because the win7 targets
+          # are not distributed via rustup. They cover Windows 7, 8, 8.1,
+          # 10 and 11 in one binary each (Windows maintains binary
+          # backward compatibility).
+          #
+          # Vista is IMPOSSIBLE: Rust never had Vista support.
+          #
+          # These are marked 'experimental' so a Tier 3 breakage does not
+          # block the rest of the release. If they fail, the other 12
+          # artifacts still publish normally.
+          #
+          # These jobs benefit the most from caching: `-Z build-std`
+          # recompiles the entire standard library on every run.
+          # -----------------------------------------------------------------
+          - name: windows-x86_64-win7
+            os: ubuntu-latest
+            rust-target: x86_64-win7-windows-msvc
+            builder: win7
+            suffix: windows-x86_64-win7
+            binary: gnirehtet.exe
+            experimental: true
+
+          - name: windows-i686-win7
+            os: ubuntu-latest
+            rust-target: i686-win7-windows-msvc
+            builder: win7
+            suffix: windows-i686-win7
+            binary: gnirehtet.exe
+            experimental: true
+
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental || false }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Rust toolchain. When `install-targets` is set, use that; otherwise
+      # fall back to `rust-target`. For the win7 targets we need nightly
+      # because they are Tier 3 and require `-Z build-std`.
+      # ------------------------------------------------------------------
+      - name: Install Rust toolchain (stable)
+        if: matrix.builder != 'win7'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.install-targets || matrix.rust-target }}
+
+      - name: Install Rust toolchain (nightly, for win7 targets)
+        if: matrix.builder == 'win7'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      # ------------------------------------------------------------------
+      # Cache layer 2: cargo tools.
+      #
+      # Stores the compiled binaries of cross / cargo-zigbuild / cargo-xwin
+      # (~/.cargo/bin) and the downloaded crate sources (~/.cargo/registry).
+      # On a cache hit, the "Install cross" / "Install cargo-zigbuild" /
+      # "Install cargo-xwin" steps below become no-ops because the binary
+      # already exists and cargo's version check passes.
+      #
+      # Key: runner OS + arch. A toolchain update (e.g. new cross release)
+      # automatically misses the cache because the compiled binary has a
+      # different hash, forcing a fresh install. Bump the -v1 suffix only
+      # if you need to purge everything explicitly.
+      # ------------------------------------------------------------------
+      - name: Cache cargo tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-tools-v1
+
+      # ------------------------------------------------------------------
+      # Cache layer 3: cargo target directory.
+      #
+      # Stores the full relay-rust/target/ tree: fingerprints, build
+      # script outputs, compiled proc-macros, linked binaries for the
+      # current target triple.
+      #
+      # Skipped for 'cross' (writes the target dir from inside a Docker
+      # container, causing potential permission mismatches on restore).
+      #
+      # Key: runner OS + target triple + Cargo.lock hash. The lock hash
+      # invalidates the cache whenever any dependency version changes.
+      # The restore-keys fallback restores an older cache for the same
+      # target so that partial recompilation can still benefit from
+      # preserved fingerprints.
+      # ------------------------------------------------------------------
+      - name: Cache cargo target
+        if: matrix.builder != 'cross'
+        uses: actions/cache@v4
+        with:
+          path: relay-rust/target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust-target }}-cargo-target-${{ hashFiles('relay-rust/Cargo.lock', 'relay-rust/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust-target }}-cargo-target-
+
+      # ------------------------------------------------------------------
+      # Cache layer 1: sccache.
+      #
+      # Enabled for every builder except 'cross' (see note above).
+      #
+      # SCCACHE_GHA_ENABLED tells sccache to use GitHub Actions' cache
+      # service as its backend. RUSTC_WRAPPER makes cargo invoke sccache
+      # in front of every rustc call. The cache key includes the rustc
+      # version, the target triple and all build flags, so different
+      # targets never collide.
+      #
+      # To invalidate after a toolchain bump or a major dependency
+      # update, bump SCCACHE_GHA_VERSION.
+      # ------------------------------------------------------------------
+      - name: Install sccache
+        if: matrix.builder != 'cross'
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Enable sccache
+        if: matrix.builder != 'cross'
+        shell: bash
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          echo "SCCACHE_GHA_VERSION=v1" >> $GITHUB_ENV
+
+      # ------------------------------------------------------------------
+      # Per-builder toolchain setup
+      # ------------------------------------------------------------------
+      - name: Install musl-tools
+        if: matrix.builder == 'native-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        run: cargo install --locked cross
+
+      - name: Install Zig
+        if: matrix.builder == 'zigbuild'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.13.0
+          curl -sSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+            | tar -xJ -C /tmp
+          sudo mv "/tmp/zig-linux-x86_64-${ZIG_VERSION}" /opt/zig
+          sudo ln -sf /opt/zig/zig /usr/local/bin/zig
+          zig version
+
+      - name: Install cargo-zigbuild
+        if: matrix.builder == 'zigbuild'
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Install clang + lld (for cargo-xwin and win7)
+        if: matrix.builder == 'xwin' || matrix.builder == 'win7'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld
+
+      - name: Install cargo-xwin
+        if: matrix.builder == 'xwin' || matrix.builder == 'win7'
+        run: cargo install --locked cargo-xwin
+
+      # ------------------------------------------------------------------
+      # Build
+      # ------------------------------------------------------------------
+      - name: Build (native-musl, Linux x86_64)
+        if: matrix.builder == 'native-musl'
+        run: |
+          cargo build --release \
+            --target ${{ matrix.rust-target }} \
+            --manifest-path relay-rust/Cargo.toml
+
+      - name: Build (native, macOS / Windows)
+        if: matrix.builder == 'native'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment-target }}
+        run: |
+          cargo build --release \
+            --target ${{ matrix.rust-target }} \
+            --manifest-path relay-rust/Cargo.toml
+
+      - name: Build (cross, Linux ARM musl)
+        if: matrix.builder == 'cross'
+        run: |
+          cross build --release \
+            --target ${{ matrix.rust-target }} \
+            --manifest-path relay-rust/Cargo.toml
+
+      - name: Build (zigbuild, optional glibc pin)
+        if: matrix.builder == 'zigbuild'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.rust-target }}"
+          if [ -n "${{ matrix.glibc }}" ]; then
+            TARGET="${TARGET}.${{ matrix.glibc }}"
+          fi
+          echo "cargo zigbuild --release --target $TARGET"
+          cargo zigbuild --release --target "$TARGET" \
+            --manifest-path relay-rust/Cargo.toml
+
+      - name: Build (cargo-xwin, Windows ARM64)
+        if: matrix.builder == 'xwin'
+        run: |
+          cargo xwin build --release \
+            --target ${{ matrix.rust-target }} \
+            --manifest-path relay-rust/Cargo.toml
+
+      - name: Build (cargo-xwin + -Z build-std, Windows 7)
+        if: matrix.builder == 'win7'
+        run: |
+          cargo +nightly xwin build -Z build-std \
+            --target ${{ matrix.rust-target }} \
+            --release \
+            --manifest-path relay-rust/Cargo.toml
+
+      - name: Build (universal2 via lipo)
+        if: matrix.builder == 'universal2'
+        shell: bash
+        run: |
+          set -euo pipefail
+          MACOSX_DEPLOYMENT_TARGET=10.12 cargo build --release \
+            --target x86_64-apple-darwin \
+            --manifest-path relay-rust/Cargo.toml
+          MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release \
+            --target aarch64-apple-darwin \
+            --manifest-path relay-rust/Cargo.toml
+          mkdir -p relay-rust/target/universal2-apple-darwin/release
+          lipo -create \
+            relay-rust/target/x86_64-apple-darwin/release/gnirehtet \
+            relay-rust/target/aarch64-apple-darwin/release/gnirehtet \
+            -output relay-rust/target/universal2-apple-darwin/release/gnirehtet
+          file relay-rust/target/universal2-apple-darwin/release/gnirehtet
+
+      # ------------------------------------------------------------------
+      # Diagnostic: show sccache stats. Harmless if sccache failed to
+      # start (the `|| true` swallows the error). Useful during the
+      # first few runs to confirm the cache is working as expected.
+      # ------------------------------------------------------------------
+      - name: Show sccache stats
+        if: always() && matrix.builder != 'cross'
+        shell: bash
+        run: |
+          "$SCCACHE_PATH" --show-stats || true
+
+      # ------------------------------------------------------------------
+      # Fetch the release APK produced by job 1
+      # ------------------------------------------------------------------
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: gnirehtet-apk
+          path: apk
+
+      # ------------------------------------------------------------------
+      # Package into a per-platform zip that includes both the relay
+      # binary and the signed gnirehtet.apk
+      # ------------------------------------------------------------------
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="gnirehtet-${{ matrix.suffix }}"
+          mkdir -p "dist/$DIR"
+
+          BIN="relay-rust/target/${{ matrix.rust-target }}/release/${{ matrix.binary }}"
+          if [ ! -f "$BIN" ]; then
+            echo "Binary not found at $BIN, searching..."
+            BIN=$(find relay-rust/target -path "*/release/${{ matrix.binary }}" -type f | head -1)
+            if [ -z "$BIN" ]; then
+              echo "::error::Could not locate built binary"
+              find relay-rust/target -maxdepth 3 -type f | head -30
+              exit 1
+            fi
+            echo "Found binary at: $BIN"
+          fi
+
+          cp "$BIN" "dist/$DIR/${{ matrix.binary }}"
+          cp apk/app-release.apk "dist/$DIR/gnirehtet.apk"
+          cd dist
+          zip -r "$DIR.zip" "$DIR"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "gnirehtet-${{ matrix.suffix }}"
+          New-Item -ItemType Directory -Force -Path "dist/$dir" | Out-Null
+
+          $bin = "relay-rust/target/${{ matrix.rust-target }}/release/${{ matrix.binary }}"
+          if (-not (Test-Path $bin)) {
+            throw "Binary not found at $bin"
+          }
+          Copy-Item $bin "dist/$dir/${{ matrix.binary }}"
+          Copy-Item "apk/app-release.apk" "dist/$dir/gnirehtet.apk"
+          Compress-Archive -Path "dist/$dir" -DestinationPath "dist/$dir.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gnirehtet-${{ matrix.target.archive-suffix }}
-          path: dist/gnirehtet-${{ matrix.target.archive-suffix }}.zip
+          name: gnirehtet-${{ matrix.suffix }}
+          path: dist/gnirehtet-${{ matrix.suffix }}.zip
 
+  # =====================================================================
+  # Job 3: Publish the GitHub Release with all artifacts plus checksums.
+  # =====================================================================
   release:
+    name: Create GitHub Release
     needs: [build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           pattern: gnirehtet-*
           merge-multiple: true
 
-      - name: Checksums
+      - name: Generate SHA256SUMS
         run: sha256sum gnirehtet-*.zip > SHA256SUMS.txt
 
-      - uses: softprops/action-gh-release@v2
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
           files: |
             gnirehtet-*.zip
             SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -22,6 +22,7 @@ use crate::adb::{ensure_adb, exec_adb, get_apk_path, must_install_client};
 use crate::execution_error::{Cmd, CommandExecutionError, ProcessIoError, ProcessStatusError};
 use crate::adb_monitor::AdbMonitor;
 use relaylib::relay::tcp_connection;
+use relaylib::relay::serial_registry;
 
 const TAG: &str = "Main";
 
@@ -180,6 +181,46 @@ pub fn cmd_relay(port: u16) -> Result<(), CommandExecutionError> {
     Ok(())
 }
 
+/// Return the ADB serial of the device this `cmd_start` call is targeting.
+///
+/// If `serial` is `None`, try to auto-detect a single connected device.
+/// Return `None` if there are zero or multiple devices, in which case the
+/// serial correlation is skipped (the relay falls back to `Client #N`
+/// without a serial in the logs).
+fn effective_serial(serial: Option<&str>) -> Option<String> {
+    if let Some(s) = serial {
+        return Some(s.to_string());
+    }
+    let adb = crate::adb::get_adb_path();
+    let out = std::process::Command::new(&adb)
+        .args(["devices"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let devices: Vec<String> = stdout
+        .lines()
+        .skip(1) // "List of devices attached"
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let serial = parts.next()?;
+            let state = parts.next()?;
+            if state == "device" {
+                Some(serial.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if devices.len() == 1 {
+        Some(devices[0].clone())
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_start(
     serial: Option<&str>,
@@ -200,6 +241,14 @@ pub fn cmd_start(
     }
 
     info!(target: TAG, "Starting client...");
+
+    // Best-effort correlation: remember which serial is about to open a
+    // connection to the relay. See relay::serial_registry for details.
+    if let Some(s) = effective_serial(serial) {
+        serial_registry::register_pending(&s);
+        debug!(target: TAG, "Registered serial {} for the next relay connection", s);
+    }
+
     cmd_tunnel(serial, port)?;
 
     let mut adb_args: Vec<String> = vec![

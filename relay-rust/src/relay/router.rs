@@ -8,7 +8,7 @@ use std::io;
 use std::rc::{Rc, Weak};
 
 use super::binary;
-use super::client::{Client, ClientChannel};
+use super::client::{Client, ClientChannel, SharedBuffer};
 use super::connection::{Connection, ConnectionId};
 use super::ip_packet::IpPacket;
 use super::ipv4_header::Protocol;
@@ -19,6 +19,12 @@ const TAG: &str = "Router";
 
 pub struct Router {
     client: Weak<RefCell<Client>>,
+    /// Shared outgoing buffer. Passed to every connection so that they can
+    /// write back to the device without borrowing the `Client`.
+    buffer: Option<SharedBuffer>,
+    /// Label included in every connection id so that log lines can be
+    /// correlated with a specific device.
+    client_label: Rc<str>,
     connections: HashMap<ConnectionId, Rc<RefCell<dyn Connection>>>,
 }
 
@@ -26,6 +32,8 @@ impl Router {
     pub fn new() -> Self {
         Self {
             client: Weak::new(),
+            buffer: None,
+            client_label: Rc::from(""),
             connections: HashMap::new(),
         }
     }
@@ -34,13 +42,21 @@ impl Router {
         self.client = client;
     }
 
+    /// Set the client label used in connection ids. Must be called before
+    /// any connection is created.
+    pub fn set_client_label(&mut self, label: &str) {
+        self.client_label = Rc::from(label);
+    }
+
+    /// Register the shared outgoing buffer. Must be called before any
+    /// connection is created.
+    pub fn set_buffer(&mut self, buffer: SharedBuffer) {
+        self.buffer = Some(buffer);
+    }
+
     /// Route an IP packet from the device to the appropriate connection.
     /// Creates a new connection if one doesn't exist for this flow.
-    pub fn send_to_network(
-        &mut self,
-        client_channel: &mut ClientChannel,
-        ip_packet: &IpPacket,
-    ) {
+    pub fn send_to_network(&mut self, client_channel: &mut ClientChannel, ip_packet: &IpPacket) {
         if ip_packet.is_valid() {
             let id = {
                 let (ip_header_data, transport_header_data) = ip_packet.headers_data();
@@ -48,8 +64,12 @@ impl Router {
                     warn!(target: TAG, "Dropping packet: no transport header data");
                     return;
                 };
-                ConnectionId::from_headers(&ip_header_data, transport_header_data)
-            };
+                ConnectionId::from_headers(
+                    &ip_header_data,
+                    transport_header_data,
+                    self.client_label.clone(),
+                )
+        };
             match self.connections.entry(id.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let mut connection = entry.get().borrow_mut();
@@ -61,7 +81,14 @@ impl Router {
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    match Self::create_connection(id.clone(), &self.client, ip_packet) {
+                    let buffer = match self.buffer.clone() {
+                        Some(b) => b,
+                        None => {
+                            error!(target: TAG, "Router buffer not initialized, dropping packet");
+                            return;
+                        }
+                    };
+                    match Self::create_connection(id.clone(), &self.client, &buffer, ip_packet) {
                         Ok(connection) => {
                             entry.insert(connection);
                         }
@@ -86,27 +113,28 @@ impl Router {
     fn create_connection(
         id: ConnectionId,
         client: &Weak<RefCell<Client>>,
+        buffer: &SharedBuffer,
         ip_packet: &IpPacket,
     ) -> io::Result<Rc<RefCell<dyn Connection>>> {
         let (ip_header, transport_header) = ip_packet.headers();
-        let transport_header = transport_header
-            .ok_or_else(|| io::Error::other("No transport header"))?;
+        let transport_header =
+            transport_header.ok_or_else(|| io::Error::other("No transport header"))?;
         match id.protocol() {
             Protocol::Tcp => Ok(TcpConnection::create(
                 id,
                 client.clone(),
+                buffer.clone(),
                 ip_header,
                 transport_header,
             )?),
             Protocol::Udp => Ok(UdpConnection::create(
                 id,
                 client.clone(),
+                buffer.clone(),
                 ip_header,
                 transport_header,
             )?),
-            p => Err(io::Error::other(
-                format!("Unsupported protocol: {:?}", p),
-            )),
+            p => Err(io::Error::other(format!("Unsupported protocol: {:?}", p))),
         }
     }
 
@@ -154,10 +182,7 @@ impl Router {
                             None
                         }
                     }
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        // no progress, that's fine
-                        None
-                    }
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => None,
                     Err(_) => {
                         // error — close the connection
                         conn.close();

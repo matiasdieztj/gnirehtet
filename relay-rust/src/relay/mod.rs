@@ -16,6 +16,7 @@
 
 pub use self::relay::Relay;
 pub mod byte_buffer;
+pub mod serial_registry;
 
 mod binary;
 mod client;
@@ -34,7 +35,6 @@ mod ipv4_header;
 mod ipv4_packet;
 mod ipv6_header;
 mod net;
-mod packet_source;
 mod packetizer;
 #[allow(clippy::module_inception)] // relay.rs is in relay/
 mod relay;

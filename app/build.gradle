@@ -1,26 +1,34 @@
 apply plugin: 'com.android.application'
 
 android {
-    compileSdk 35
-    namespace 'com.genymobile.gnirehtet'
+    compileSdk = 35
+    namespace = 'com.genymobile.gnirehtet'
 
     defaultConfig {
-        applicationId "com.genymobile.gnirehtet"
-        minSdk 21
-        targetSdk 35
-        versionCode 10
-        versionName "2.6.0"
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        applicationId = "com.genymobile.gnirehtet"
+        minSdk = 21
+        targetSdk = 35
+        versionCode = 10
+        versionName = "2.6.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildTypes {
         release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // Sign with the built-in debug keystore. AGP auto-generates
+            // ~/.android/debug.keystore on the runner the first time it is
+            // needed, so no secrets or keystore files are required in CI.
+            //
+            // The resulting APK is verifiable as "CN=Android Debug".
+            // Note: any APK can be signed with the same public debug key,
+            // so this is NOT suitable for adversarial distribution.
+            signingConfig = signingConfigs.debug
+            minifyEnabled = false
+            proguardFiles = getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_11
-        targetCompatibility JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 }
 
@@ -30,4 +38,7 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
 }
 
+// Optional release signing override. Only takes effect when
+// `RELEASE_STORE_FILE` is defined in gradle.properties (which is never
+// the case in CI). Safe to keep.
 apply from: "$project.rootDir/config/android-signing.gradle"

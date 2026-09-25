@@ -4,6 +4,7 @@
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::rc::Rc;
 
 use super::client::ClientChannel;
 use super::ipv4_header::Protocol;
@@ -32,6 +33,10 @@ pub trait Connection {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ConnectionId {
+    /// Rc so that cloning the id per packet is a refcount bump, not an
+    /// allocation. Empty when no client was registered (should not happen
+    /// in normal operation).
+    client_label: Rc<str>,
     protocol: Protocol,
     source_ip: IpAddr,
     source_port: u16,
@@ -44,6 +49,7 @@ impl ConnectionId {
     pub fn from_headers(
         ip_header_data: &IpHeaderData,
         transport_header_data: &TransportHeaderData,
+        client_label: Rc<str>,
     ) -> Self {
         let source_ip = ip_header_data.source();
         let source_port = transport_header_data.source_port();
@@ -55,6 +61,7 @@ impl ConnectionId {
             net::to_socket_addr(destination_ip, destination_port)
         );
         Self {
+            client_label,
             protocol: ip_header_data.protocol(),
             source_ip,
             source_port,
@@ -89,7 +96,11 @@ impl ConnectionId {
 
 impl fmt::Display for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.id_string)
+        if self.client_label.is_empty() {
+            write!(f, "{}", self.id_string)
+        } else {
+            write!(f, "[Client {}] {}", self.client_label, self.id_string)
+        }
     }
 }
 

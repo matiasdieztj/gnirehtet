@@ -26,7 +26,7 @@ echo "Building for ${PLATFORM}${ARCH}..."
 # Build Rust relay
 cargo build --release --manifest-path relay-rust/Cargo.toml
 
-# Build APK (optional — may fail without Android SDK)
+# Build release APK (optional — may fail without Android SDK)
 if command -v javac &>/dev/null; then
     bash scripts/build-apk.sh 2>/dev/null || echo "APK build skipped (no Android SDK?)"
 fi
@@ -34,9 +34,13 @@ fi
 # Bundle
 mkdir -p "$DIST/$DIR_NAME"
 cp "relay-rust/target/release/$BINARY" "$DIST/$DIR_NAME/gnirehtet$([[ $PLATFORM == "windows" ]] && echo ".exe" || true)"
-[ -f app/build/outputs/apk/debug/app-debug.apk ] && \
-    cp app/build/outputs/apk/debug/app-debug.apk "$DIST/$DIR_NAME/gnirehtet.apk"
 
+APK_RELEASE=app/build/outputs/apk/release/app-release.apk
+if [ -f "$APK_RELEASE" ]; then
+    cp "$APK_RELEASE" "$DIST/$DIR_NAME/gnirehtet.apk"
+else
+    echo "WARNING: $APK_RELEASE not found — the zip will not include the APK." >&2
+fi
 
 # Package
 cd "$DIST"

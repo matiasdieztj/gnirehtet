@@ -21,6 +21,7 @@ use log::*;
 use std::io;
 
 use super::client::Client;
+use super::serial_registry;
 
 const TAG: &str = "Relay";
 
@@ -45,10 +46,17 @@ impl Relay {
         info!(target: TAG, "Relay server started on port {}", self.port);
         loop {
             let (stream, peer) = listener.accept().await?;
-            debug!(target: TAG, "New connection from {}", peer);
+
+            // Best-effort: consume the oldest pending serial, if any.
+            let serial = serial_registry::take_pending();
+            match &serial {
+                Some(s) => debug!(target: TAG, "New connection from {} (serial {})", peer, s),
+                None => debug!(target: TAG, "New connection from {}", peer),
+            }
+
             let std_stream = stream.into_std()?;
             std::thread::spawn(move || {
-                Client::run_blocking(std_stream);
+                Client::run_blocking(std_stream, serial);
             });
         }
     }

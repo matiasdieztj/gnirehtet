@@ -10,7 +10,7 @@ use std::rc::{Rc, Weak};
 use std::time::Instant;
 
 use super::binary;
-use super::client::{Client, ClientChannel};
+use super::client::{Client, ClientChannel, SharedBuffer};
 use super::connection::{Connection, ConnectionId};
 use super::datagram_buffer::DatagramBuffer;
 use super::ip_header::IpHeader;
@@ -33,6 +33,9 @@ pub static mut GLOBAL_BYTES_RECEIVED: u64 = 0;
 pub struct UdpConnection {
     id: ConnectionId,
     client: Weak<RefCell<Client>>,
+    /// Shared outgoing buffer. Writes here go directly to the device without
+    /// borrowing the `Client` (which is already borrowed during poll).
+    buffer: SharedBuffer,
     socket: UdpSocket,
     client_to_network: DatagramBuffer,
     network_to_client: Packetizer,
@@ -47,6 +50,7 @@ impl UdpConnection {
     pub fn create(
         id: ConnectionId,
         client: Weak<RefCell<Client>>,
+        buffer: SharedBuffer,
         ip_header: IpHeader,
         transport_header: TransportHeader,
     ) -> io::Result<Rc<RefCell<Self>>> {
@@ -56,6 +60,7 @@ impl UdpConnection {
         let rc = Rc::new(RefCell::new(Self {
             id,
             client,
+            buffer,
             socket,
             client_to_network: DatagramBuffer::new(4 * MAX_PACKET_LENGTH),
             network_to_client: packetizer,
@@ -68,9 +73,23 @@ impl UdpConnection {
     }
 
     fn create_socket(id: &ConnectionId) -> io::Result<UdpSocket> {
-        let autobind_addr = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0));
+        let destination = id.rewritten_destination();
+
+        // Bind the UDP socket to the SAME address family as the destination.
+        //
+        // On Linux and macOS, binding to the IPv6 unspecified address ([::]) yields a
+        // dual-stack socket that can also send to IPv4 destinations.
+        //
+        // On Windows, an IPv6 socket CANNOT send to an IPv4 address: Winsock returns
+        // WSAEFAULT (os error 10014). Therefore, the bind address MUST match the
+        // destination family on every platform.
+        let autobind_addr = match destination {
+            SocketAddr::V4(_) => SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+        };
+
         let udp_socket = UdpSocket::bind(autobind_addr)?;
-        udp_socket.connect(id.rewritten_destination())?;
+        udp_socket.connect(destination)?;
         udp_socket.set_nonblocking(true)?;
 
         // Priority 6: Increase SO_RCVBUF to 2MB for better UDP throughput
@@ -88,7 +107,13 @@ impl UdpConnection {
                 return;
             }
         };
-        let mut client = client_rc.borrow_mut();
+        let mut client = match client_rc.try_borrow_mut() {
+            Ok(c) => c,
+            Err(_) => {
+                cx_debug!(target: TAG, self.id, "Client busy, skipping remove_from_router");
+                return;
+            }
+        };
         client.router().remove(&self.id);
     }
 
@@ -177,34 +202,36 @@ impl UdpConnection {
     fn read(&mut self) -> io::Result<()> {
         let ip_packet = self.network_to_client.packetize(&mut self.socket)?;
         self.bytes_received += ip_packet.payload().map(|p| p.len() as u64).unwrap_or(0);
-        let client_rc = match self.client.upgrade() {
-            Some(c) => c,
-            None => {
-                warn!(target: TAG, "Client already dropped, cannot send UDP packet");
+
+        // Write directly to the shared buffer. No `Client` borrow is needed,
+        // so this call cannot conflict with the main relay loop.
+        let mut buffer = match self.buffer.try_borrow_mut() {
+            Ok(b) => b,
+            Err(_) => {
+                cx_debug!(target: TAG, self.id, "Client buffer busy, dropping UDP packet");
                 return Ok(());
             }
         };
-        match client_rc
-            .borrow_mut()
-            .send_to_client(&ip_packet)
-        {
-            Ok(_) => {
-                cx_debug!(
+        if ip_packet.length() as usize <= buffer.remaining() {
+            buffer.read_from(ip_packet.raw());
+            drop(buffer);
+            cx_debug!(
+                target: TAG,
+                self.id,
+                "Packet ({} bytes) sent to client",
+                ip_packet.length()
+            );
+            if log_enabled!(target: TAG, Level::Trace) {
+                cx_trace!(
                     target: TAG,
                     self.id,
-                    "Packet ({} bytes) sent to client",
-                    ip_packet.length()
+                    "{}",
+                    binary::build_packet_string(ip_packet.raw())
                 );
-                if log_enabled!(target: TAG, Level::Trace) {
-                    cx_trace!(
-                        target: TAG,
-                        self.id,
-                        "{}",
-                        binary::build_packet_string(ip_packet.raw())
-                    );
-                }
             }
-            Err(_) => cx_warn!(target: TAG, self.id, "Cannot send to client, drop packet"),
+        } else {
+            drop(buffer);
+            cx_warn!(target: TAG, self.id, "Client buffer full, dropping UDP packet");
         }
         Ok(())
     }
@@ -224,11 +251,7 @@ impl Connection for UdpConnection {
         &self.id
     }
 
-    fn send_to_network(
-        &mut self,
-        _: &mut ClientChannel,
-        ip_packet: &IpPacket,
-    ) {
+    fn send_to_network(&mut self, _: &mut ClientChannel, ip_packet: &IpPacket) {
         if let Some(payload) = ip_packet.payload() {
             self.bytes_sent += payload.len() as u64;
             match self.client_to_network.read_from(payload) {
