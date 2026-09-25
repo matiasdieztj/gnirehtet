@@ -22,8 +22,11 @@ android {
             // Note: any APK can be signed with the same public debug key,
             // so this is NOT suitable for adversarial distribution.
             signingConfig = signingConfigs.debug
-            minifyEnabled = false
-            proguardFiles = getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            minifyEnabled = true
+            shrinkResources = true
+            // proguardFiles is a method in the AGP DSL, not a property.
+            // Using `=` here breaks Groovy's method resolution.
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
     compileOptions {
