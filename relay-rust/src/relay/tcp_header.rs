@@ -272,6 +272,12 @@ impl<'a> TcpHeaderMut<'a> {
     }
 
     #[inline]
+    pub fn set_window(&mut self, window: u16) {
+        self.data.window = window;
+        BigEndian::write_u16(&mut self.raw[14..16], window);
+    }
+
+    #[inline]
     pub fn shrink_options(&mut self) {
         self.set_data_offset(5);
     }

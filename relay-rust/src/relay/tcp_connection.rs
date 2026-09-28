@@ -537,10 +537,12 @@ impl TcpConnection {
         );
         let max_payload_length =
             Some(cmp::min(remaining_client_window, MAX_PAYLOAD_LENGTH) as usize);
+        let advertised_window = self.advertised_window();
         Self::update_headers(
             &mut self.network_to_client,
             &self.tcb,
             tcp_header::FLAG_ACK | tcp_header::FLAG_PSH,
+            advertised_window,
         );
         match self
             .network_to_client
@@ -604,11 +606,13 @@ impl TcpConnection {
     /// into the shared buffer. No `Client` borrow is performed, so this is safe
     /// to call from within `poll_self()`.
     fn send_empty_packet_to_client(&mut self, flags: u16) {
+        let window = self.advertised_window();
         let ip_packet = Self::create_empty_response_packet(
             &self.id,
             &mut self.network_to_client,
             &self.tcb,
             flags,
+            window,
         );
         match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
             Ok(()) => {
@@ -666,11 +670,12 @@ impl TcpConnection {
         }
     }
 
-    fn update_headers(packetizer: &mut Packetizer, tcb: &Tcb, flags: u16) {
+    fn update_headers(packetizer: &mut Packetizer, tcb: &Tcb, flags: u16, window: u16) {
         let mut tcp_header = Self::tcp_header_of_transport_mut(packetizer.transport_header_mut());
         tcp_header.set_sequence_number(tcb.sequence_number.0);
         tcp_header.set_acknowledgement_number(tcb.acknowledgement_number.0);
         tcp_header.set_flags(flags);
+        tcp_header.set_window(window);
     }
 
     fn handle_packet(&mut self, client_channel: &mut ClientChannel, ip_packet: &IpPacket) {
@@ -712,6 +717,16 @@ impl TcpConnection {
                 tcp_header.flags()
             );
             return;
+        }
+
+        if tcp_header.window() != self.tcb.client_window {
+            cx_debug!(
+                target: TAG,
+                self.id,
+                "Client window: {} -> {}",
+                self.tcb.client_window,
+                tcp_header.window()
+            );
         }
 
         self.tcb.client_window = tcp_header.window();
@@ -905,11 +920,13 @@ impl TcpConnection {
     /// Reply through an explicit `ClientChannel` (used only when the packet
     /// arrives from the device, i.e. when no buffer borrow conflict exists).
     fn reply_empty_packet_to_client(&mut self, client_channel: &mut ClientChannel, flags: u16) {
+        let window = self.advertised_window();
         let ip_packet = Self::create_empty_response_packet(
             &self.id,
             &mut self.network_to_client,
             &self.tcb,
             flags,
+            window,
         );
         let _ = client_channel.send_to_client(&ip_packet);
     }
@@ -919,8 +936,9 @@ impl TcpConnection {
         packetizer: &'a mut Packetizer,
         tcb: &Tcb,
         flags: u16,
+        window: u16,
     ) -> IpPacket<'a> {
-        Self::update_headers(packetizer, tcb, flags);
+        Self::update_headers(packetizer, tcb, flags, window);
         cx_debug!(
             target: TAG,
             id,
@@ -951,6 +969,15 @@ impl TcpConnection {
             return false;
         }
         self.tcb.remaining_client_window() > 0
+    }
+
+    /// Advertised TCP receive window: how much space is left in our buffer
+    /// for data coming from the device. This provides backpressure — when the
+    /// buffer is nearly full, the window shrinks to 0 and the device stops
+    /// sending, avoiding the "Not enough space, dropping packet" → retransmit
+    /// → "Ignoring packet" loop that burns CPU.
+    fn advertised_window(&self) -> u16 {
+        self.client_to_network.remaining().min(u16::MAX as usize) as u16
     }
 
     fn may_write(&self) -> bool {
