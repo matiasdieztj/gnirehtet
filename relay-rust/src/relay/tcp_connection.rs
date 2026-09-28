@@ -486,7 +486,6 @@ impl TcpConnection {
             Ok(w) => {
                 if w != 0 {
                     self.bytes_sent += w as u64;
-                    self.tcb.acknowledgement_number += Wrapping(w as u32);
 
                     if self.tcb.fin_received && self.client_to_network.is_empty() {
                         cx_debug!(
@@ -686,9 +685,23 @@ impl TcpConnection {
             return;
         }
 
-        let expected_packet =
-            (self.tcb.acknowledgement_number + Wrapping(self.client_to_network.size() as u32)).0;
+        let expected_packet = self.tcb.acknowledgement_number.0;
         if tcp_header.sequence_number() != expected_packet {
+            // ¿Es una retransmisión? (seq < expected en aritmética de wraparound)
+            let diff = tcp_header.sequence_number().wrapping_sub(expected_packet) as i32;
+            if diff < 0 {
+                // El emisor está repitiendo un segmento que ya ACKeamos.
+                // Reenviar el ACK actual para que pueda avanzar.
+                cx_debug!(
+                    target: TAG,
+                    self.id,
+                    "Retransmission (seq={} < expected={}); re-ACKing",
+                    tcp_header.sequence_number(),
+                    expected_packet
+                );
+                self.send_empty_packet_to_client(tcp_header::FLAG_ACK);
+                return;
+            }
             cx_warn!(
                 target: TAG,
                 self.id,
@@ -869,19 +882,24 @@ impl TcpConnection {
         }
 
         let payload = match ip_packet.payload() {
-            Some(p) => p,
-            None => return,
+            Some(p) if !p.is_empty() => p,
+            _ => return,
         };
-        if payload.is_empty() {
-            return;
-        }
 
         if self.client_to_network.remaining() < payload.len() {
             cx_warn!(target: TAG, self.id, "Not enough space, dropping packet");
+            // Enviar ACK con la ventana actual. Si el buffer está lleno, la
+            // ventana será 0 y el dispositivo dejará de mandar. Sin esto, el
+            // dispositivo retransmite para siempre y cada retransmisión se
+            // ignora (seq mismatch), quemando CPU.
+            self.send_empty_packet_to_client(tcp_header::FLAG_ACK);
             return;
         }
 
         self.client_to_network.read_from(payload);
+        // ACK inmediato al dispositivo por los bytes recién recibidos
+        self.tcb.acknowledgement_number += Wrapping(payload.len() as u32);
+        self.send_empty_packet_to_client(tcp_header::FLAG_ACK);
     }
 
     /// Reply through an explicit `ClientChannel` (used only when the packet
