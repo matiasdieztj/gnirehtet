@@ -204,7 +204,7 @@ impl TcpConnection {
             client,
             buffer,
             stream,
-            client_to_network: StreamBuffer::new(4 * MAX_PACKET_LENGTH),
+            client_to_network: StreamBuffer::new(32 * MAX_PACKET_LENGTH),
             network_to_client: packetizer,
             packet_for_client_length: None,
             closed: false,

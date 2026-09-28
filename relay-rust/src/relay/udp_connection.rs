@@ -62,7 +62,7 @@ impl UdpConnection {
             client,
             buffer,
             socket,
-            client_to_network: DatagramBuffer::new(4 * MAX_PACKET_LENGTH),
+            client_to_network: DatagramBuffer::new(32 * MAX_PACKET_LENGTH),
             network_to_client: packetizer,
             closed: false,
             idle_since: Instant::now(),

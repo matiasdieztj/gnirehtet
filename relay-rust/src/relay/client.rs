@@ -103,7 +103,7 @@ impl Client {
         };
 
         let buffer: SharedBuffer =
-            Rc::new(RefCell::new(StreamBuffer::new(16 * MAX_PACKET_LENGTH)));
+            Rc::new(RefCell::new(StreamBuffer::new(64 * MAX_PACKET_LENGTH)));
         
         let mut router = Router::new();
         router.set_buffer(buffer.clone());
