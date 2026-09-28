@@ -277,6 +277,7 @@ impl Client {
         // Main loop: poll for I/O with basic timing
         let mut read_buf = [0u8; MAX_PACKET_LENGTH];
         let mut last_cleanup = std::time::Instant::now();
+        let mut pending_outgoing: Vec<u8> = Vec::new();
 
         loop {
             let mut made_progress = false;
@@ -318,20 +319,37 @@ impl Client {
                 last_cleanup = now;
             }
 
-            // Flush outgoing data
+            // Flush outgoing data (non-blocking; whatever doesn't fit is
+            // deferred to the next iteration via `pending_outgoing`).
             let outgoing = client.drain_outgoing();
             drop(client);
 
             if !outgoing.is_empty() {
-                made_progress = true;
-                if write_all(&mut stream, &outgoing).is_err() {
-                    error!(target: TAG, "Client {} write error", label);
-                    break;
+                if pending_outgoing.is_empty() {
+                    pending_outgoing = outgoing;
+                } else {
+                    pending_outgoing.extend_from_slice(&outgoing);
+                }
+            }
+
+            if !pending_outgoing.is_empty() {
+                match write_partial(&mut stream, &pending_outgoing) {
+                    Ok(0) => {
+                        // Socket is full; retry on the next iteration.
+                    }
+                    Ok(n) => {
+                        made_progress = true;
+                        pending_outgoing.drain(..n);
+                    }
+                    Err(e) => {
+                        error!(target: TAG, "Client {} write error: {}", label, e);
+                        break;
+                    }
                 }
             }
 
             if !made_progress {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_micros(100));
             }
         }
 
@@ -356,7 +374,19 @@ fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Helper: write all bytes to a non-blocking stream.
+/// Write as many bytes as possible without blocking. Returns how many bytes
+/// were actually accepted by the socket (0 if the socket is full).
+fn write_partial(stream: &mut TcpStream, buf: &[u8]) -> io::Result<usize> {
+    match stream.write(buf) {
+        Ok(n) => Ok(n),
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Blocking helper used only for the initial client-ID handshake, before
+/// the main event loop starts. The socket is freshly accepted and the
+/// write is only 4 bytes, so a bounded spin-wait is safe here.
 fn write_all(stream: &mut TcpStream, buf: &[u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < buf.len() {
@@ -364,7 +394,7 @@ fn write_all(stream: &mut TcpStream, buf: &[u8]) -> io::Result<()> {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")),
             Ok(n) => offset += n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_micros(100));
             }
             Err(e) => return Err(e),
         }
