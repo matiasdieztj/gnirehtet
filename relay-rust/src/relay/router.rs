@@ -90,6 +90,13 @@ impl Router {
                     };
                     match Self::create_connection(id.clone(), &self.client, &buffer, ip_packet) {
                         Ok(connection) => {
+                            // El paquete que disparó la creación también tiene que reenviarse:
+                            // para TCP el SYN va sin payload y el handshake es sintético, pero
+                            // para UDP el primer paquete ES el payload. Sin esta llamada, la
+                            // primera consulta DNS (o el primer probe QUIC) se descarta.
+                            connection
+                                .borrow_mut()
+                                .send_to_network(client_channel, ip_packet);
                             entry.insert(connection);
                         }
                         Err(err) => {
