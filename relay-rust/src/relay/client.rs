@@ -89,6 +89,23 @@ impl ClientChannel {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "Client buffer full"))
         }
     }
+
+    /// Write an already-built IP packet (e.g. a synthesised ICMP error)
+    /// directly into the outgoing buffer.
+    pub fn send_raw_to_client(&mut self, raw: &[u8]) -> io::Result<()> {
+        let mut buffer = match self.buffer.try_borrow_mut() {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "client buffer busy"));
+            }
+        };
+        if raw.len() <= buffer.remaining() {
+            buffer.read_from(raw);
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "Client buffer full"))
+        }
+    }
 }
 
 impl Client {

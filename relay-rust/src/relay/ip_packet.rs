@@ -154,6 +154,18 @@ impl<'a> IpPacket<'a> {
         }
     }
 
+    /// True if this is an IPv4 ICMP Echo Request (type 8).
+    pub fn is_icmp_echo_request(&self) -> bool {
+        use super::ipv4_header::Protocol;
+        match self {
+            IpPacket::V4(p) => {
+                p.ipv4_header_data().protocol() == Protocol::Icmp
+                    && p.raw().get(p.ipv4_header_data().header_length() as usize).copied() == Some(8)
+            }
+            _ => false,
+        }
+    }
+
     #[inline]
     pub fn raw(&self) -> &[u8] {
         match self {

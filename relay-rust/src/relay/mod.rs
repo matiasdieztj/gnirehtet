@@ -26,6 +26,7 @@ mod connection;
 mod datagram;
 mod datagram_buffer;
 mod dns_cache;
+mod icmp_handler;
 mod ip_header;
 mod ip_packet;
 mod ip_packet_buffer;
