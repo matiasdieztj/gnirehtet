@@ -57,6 +57,42 @@ impl Router {
     /// Route an IP packet from the device to the appropriate connection.
     /// Creates a new connection if one doesn't exist for this flow.
     pub fn send_to_network(&mut self, client_channel: &mut ClientChannel, ip_packet: &IpPacket) {
+        // Handle ICMP Echo Requests locally: synthesize an Echo Reply. This
+        // makes ping-based latency tests (WiFiman, etc.) succeed with ~0 ms RTT.
+        if ip_packet.is_icmp_echo_request() {
+            if let Some(reply) = super::icmp_handler::build_echo_reply(ip_packet.raw())
+                && let Some(ref buffer) = self.buffer
+                && let Ok(mut buf) = buffer.try_borrow_mut()
+            {
+                if reply.len() <= buf.remaining() {
+                    buf.read_from(&reply);
+                    debug!(
+                        target: TAG,
+                        "ICMP echo reply synthesized ({} bytes)",
+                        reply.len()
+                    );
+                } else {
+                    debug!(
+                        target: TAG,
+                        "Buffer full, dropping ICMP echo reply ({} bytes)",
+                        reply.len()
+                    );
+                }
+            }
+            return;
+        }
+
+        // Reject QUIC (UDP/443) with ICMP Port Unreachable so that clients
+        // fall back to TCP/443 immediately instead of hanging on QUIC timeouts.
+        // Chrome/Cronet interpret the ICMP as "QUIC blocked" and retry over TCP.
+        if Self::is_quic(ip_packet) {
+            debug!(target: TAG, "Rejecting QUIC (UDP/443) with ICMP Port Unreachable");
+            if let Some(raw) = super::icmp_handler::build_port_unreachable(ip_packet) {
+                let _ = client_channel.send_raw_to_client(&raw);
+            }
+            return;
+        }
+
         if ip_packet.is_valid() {
             let id = {
                 let (ip_header_data, transport_header_data) = ip_packet.headers_data();
@@ -106,7 +142,14 @@ impl Router {
                 }
             }
         } else {
-            warn!(target: TAG, "Dropping invalid packet");
+            // Show the protocol so we can understand exactly what is being
+            // dropped (ICMPv6, IGMP, malformed transport header, etc.).
+            let (ip_header_data, _) = ip_packet.headers_data();
+            warn!(
+                target: TAG,
+                "Dropping invalid packet (protocol={:?})",
+                ip_header_data.protocol()
+            );
             if log_enabled!(target: TAG, Level::Trace) {
                 trace!(
                     target: TAG,
@@ -202,5 +245,17 @@ impl Router {
             debug!(target: TAG, "Removing connection from router: {}", id);
             self.connections.remove(id);
         }
+    }
+
+    /// True if the packet is a UDP datagram destined to port 443 (QUIC).
+    fn is_quic(ip_packet: &IpPacket) -> bool {
+        let (ip_data, transport) = ip_packet.headers_data();
+        if !matches!(ip_data.protocol(), Protocol::Udp) {
+            return false;
+        }
+        let Some(transport) = transport else {
+            return false;
+        };
+        transport.destination_port() == 443
     }
 }

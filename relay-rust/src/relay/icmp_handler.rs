@@ -1,4 +1,3 @@
-#![allow(dead_code)] // used by feat/quic-reject; removed in the next commit
 //! Synthesizes ICMP Echo Replies for Echo Requests coming from the device.
 //!
 //! We deliberately do NOT forward ICMP to the real destination: that would
