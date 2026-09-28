@@ -91,13 +91,17 @@ public class IPPacketOutputStream extends OutputStream {
             // no packet at all
             return false;
         }
-        if (version != 4) {
+        int packetLength;
+        if (version == 4) {
+            packetLength = readPacketLength(buffer);
+        } else if (version == 6) {
+            packetLength = readIpv6PacketLength(buffer);
+        } else {
             Log.e(TAG, "Unsupported packet received, IP version is:" + version);
             Log.d(TAG, "Clearing buffer");
             buffer.clear();
             return false;
         }
-        int packetLength = readPacketLength(buffer);
         if (packetLength == -1 || packetLength > buffer.remaining()) {
             // no packet
             return false;
@@ -137,5 +141,20 @@ public class IPPacketOutputStream extends OutputStream {
         }
         // packet length is 16 bits starting at offset 2
         return Binary.unsigned(buffer.getShort(buffer.position() + 2));
+    }
+
+    /**
+     * Read the packet length for an IPv6 packet, assuming it is stored at the
+     * current position. Returns {@code -1} if not enough data is available.
+     *
+     * The IPv6 header is fixed at 40 bytes, and the "payload length" field at
+     * offset 4 holds the length of everything after that header.
+     */
+    public static int readIpv6PacketLength(ByteBuffer buffer) {
+        if (buffer.limit() < buffer.position() + 6) {
+            return -1;
+        }
+        int payloadLength = Binary.unsigned(buffer.getShort(buffer.position() + 4));
+        return payloadLength + 40;
     }
 }
