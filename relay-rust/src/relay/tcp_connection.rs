@@ -526,72 +526,94 @@ impl TcpConnection {
     }
 
     fn process_receive(&mut self) -> io::Result<()> {
-        debug_assert!(
-            self.packet_for_client_length.is_none(),
-            "A pending packet was not flushed"
-        );
-        let remaining_client_window = self.tcb.remaining_client_window();
-        debug_assert!(
-            remaining_client_window > 0,
-            "process_received() must not be called when window == 0"
-        );
-        let max_payload_length =
-            Some(cmp::min(remaining_client_window, MAX_PAYLOAD_LENGTH) as usize);
-        let advertised_window = self.advertised_window();
-        Self::update_headers(
-            &mut self.network_to_client,
-            &self.tcb,
-            tcp_header::FLAG_ACK | tcp_header::FLAG_PSH,
-            advertised_window,
-        );
-        match self
-            .network_to_client
-            .packetize_read(&mut self.stream, max_payload_length)
-        {
-            Ok(Some(ip_packet)) => {
-                self.bytes_received += ip_packet.payload().map(|p| p.len() as u64).unwrap_or(0);
-                match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
-                    Ok(()) => {
-                        let len = ip_packet.payload().unwrap().len();
-                        cx_debug!(
-                            target: TAG,
-                            self.id,
-                            "Packet ({} bytes) sent to client {}",
-                            len,
-                            self.tcb.numbers()
-                        );
-                        self.tcb.sequence_number += Wrapping(len as u32);
-                    }
-                    Err(_) => {
-                        cx_debug!(
-                            target: TAG,
-                            self.id,
-                            "Client buffer unavailable, deferring packet ({} bytes)",
-                            ip_packet.length()
-                        );
-                        self.packet_for_client_length = Some(ip_packet.length());
-                    }
-                };
+        // Read as many packets as possible per poll. Reading only one packet
+        // per call caps throughput at one packet per client-loop iteration,
+        // which forces the remote server's send window closed and starves
+        // bulk transfers (speed tests, large downloads).
+        const MAX_PACKETS_PER_POLL: usize = 32;
+        let mut made_progress = false;
+
+        for _ in 0..MAX_PACKETS_PER_POLL {
+            // If a previous packet could not be flushed to the client buffer,
+            // stop reading: we don't want to accumulate more pending data.
+            if self.packet_for_client_length.is_some() {
+                break;
             }
-            Ok(None) => {
-                self.eof();
+            if self.tcb.remaining_client_window() == 0 {
+                break;
             }
-            Err(err) => {
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    return Err(err);
+            let remaining_client_window = self.tcb.remaining_client_window();
+            let max_payload_length =
+                Some(cmp::min(remaining_client_window, MAX_PAYLOAD_LENGTH) as usize);
+            let advertised_window = self.advertised_window();
+            Self::update_headers(
+                &mut self.network_to_client,
+                &self.tcb,
+                tcp_header::FLAG_ACK | tcp_header::FLAG_PSH,
+                advertised_window,
+            );
+            match self
+                .network_to_client
+                .packetize_read(&mut self.stream, max_payload_length)
+            {
+                Ok(Some(ip_packet)) => {
+                    self.bytes_received +=
+                        ip_packet.payload().map(|p| p.len() as u64).unwrap_or(0);
+                    match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
+                        Ok(()) => {
+                            let len = ip_packet.payload().unwrap().len();
+                            cx_debug!(
+                                target: TAG,
+                                self.id,
+                                "Packet ({} bytes) sent to client {}",
+                                len,
+                                self.tcb.numbers()
+                            );
+                            self.tcb.sequence_number += Wrapping(len as u32);
+                            made_progress = true;
+                        }
+                        Err(_) => {
+                            cx_debug!(
+                                target: TAG,
+                                self.id,
+                                "Client buffer unavailable, deferring packet ({} bytes)",
+                                ip_packet.length()
+                            );
+                            self.packet_for_client_length = Some(ip_packet.length());
+                            break;
+                        }
+                    };
                 }
-                cx_error!(
-                    target: TAG,
-                    self.id,
-                    "Cannot read: [{:?}] {}",
-                    err.kind(),
-                    err
-                );
-                self.send_empty_packet_to_client(tcp_header::FLAG_RST);
-                self.close();
+                Ok(None) => {
+                    self.eof();
+                    made_progress = true;
+                    break;
+                }
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        // No more data available right now.
+                        break;
+                    }
+                    cx_error!(
+                        target: TAG,
+                        self.id,
+                        "Cannot read: [{:?}] {}",
+                        err.kind(),
+                        err
+                    );
+                    self.send_empty_packet_to_client(tcp_header::FLAG_RST);
+                    self.close();
+                    made_progress = true;
+                    break;
+                }
             }
         }
-        Ok(())
+
+        if made_progress {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "No packet read"))
+        }
     }
 
     fn process_connect(&mut self) {
