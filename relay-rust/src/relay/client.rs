@@ -180,16 +180,19 @@ impl Client {
     pub fn feed_device_data(&mut self, data: &[u8]) -> usize {
         let mut count = 0;
         let mut cursor = Cursor::new(data);
-        if self
-            .client_to_network
-            .read_from(&mut cursor)
-            .unwrap_or(false)
-        {
-            while let Some(packet) = self.client_to_network.as_ip_packet() {
+        if !self.client_to_network.read_from(&mut cursor).unwrap_or(false) {
+            return 0;
+        }
+        loop {
+            if let Some(packet) = self.client_to_network.as_ip_packet() {
                 let mut channel = ClientChannel::new(self.network_to_client.clone());
                 self.router.send_to_network(&mut channel, &packet);
                 self.client_to_network.next();
                 count += 1;
+            } else if self.client_to_network.skip_malformed() {
+                continue;
+            } else {
+                break;
             }
         }
         count

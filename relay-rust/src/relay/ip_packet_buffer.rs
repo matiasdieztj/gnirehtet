@@ -93,6 +93,35 @@ impl IpPacketBuffer {
             self.buf.consume(length as usize);
         } // silently ignore if called without a packet
     }
+
+    /// Skip bytes that cannot be the start of an IP packet (unknown IP version).
+    ///
+    /// If we ever get garbage at the head of the buffer, `available_packet_info()`
+    /// returns `None` and `next()` refuses to consume anything, so subsequent
+    /// bytes pile up forever until the buffer is full and the relay deadlocks.
+    /// Skipping one byte at a time lets us resynchronise on the next valid
+    /// packet header.
+    ///
+    /// Returns `true` if a byte was consumed, `false` if the head is either empty,
+    /// a valid packet, or a valid partial packet (in which case the caller must
+    /// wait for more data).
+    pub fn skip_malformed(&mut self) -> bool {
+        let data = self.buf.peek();
+        if data.is_empty() {
+            return false;
+        }
+        let version = data[0] >> 4;
+        if version == 4 || version == 6 {
+            return false;
+        }
+        warn!(
+            target: "IpPacketBuffer",
+            "Skipping malformed byte 0x{:02x} (IP version {}); buffer head was {} bytes",
+            data[0], version, data.len()
+        );
+        self.buf.consume(1);
+        true
+    }
 }
 
 #[cfg(test)]
