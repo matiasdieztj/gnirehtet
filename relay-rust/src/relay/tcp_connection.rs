@@ -30,7 +30,7 @@ const TAG: &str = "TcpConnection";
 /// Global SOCKS5 proxy address, set at startup by the CLI `--socks5` flag.
 pub static SOCKS5_PROXY: OnceLock<std::net::SocketAddr> = OnceLock::new();
 
-const MTU: u16 = 0x4000;
+const MTU: u16 = 1500;
 const MAX_PAYLOAD_LENGTH: u16 = MTU - 20 - 20_u16;
 
 #[allow(dead_code)]
