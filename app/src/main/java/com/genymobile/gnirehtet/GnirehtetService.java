@@ -23,6 +23,7 @@ import android.net.ConnectivityManager;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Handler;
@@ -177,28 +178,37 @@ public class GnirehtetService extends VpnService {
 
     @SuppressWarnings("checkstyle:MagicNumber")
     private void setAsUndernlyingNetwork() {
-        if (Build.VERSION.SDK_INT >= 22) {
-            Network vpnNetwork = findVpnNetwork();
-            if (vpnNetwork != null) {
-                // so that applications knows that network is available
-                setUnderlyingNetworks(new Network[] {vpnNetwork});
-            }
+        if (Build.VERSION.SDK_INT < 22) {
+            Log.w(TAG, "Cannot set underlying network, API version "
+                + Build.VERSION.SDK_INT + " < 22");
+            return;
+        }
+        Network physical = findPhysicalNetwork();
+        if (physical != null) {
+            setUnderlyingNetworks(new Network[]{physical});
         } else {
-            Log.w(TAG, "Cannot set underlying network, API version " + Build.VERSION.SDK_INT + " < 22");
+            setUnderlyingNetworks(null);   // "no underlying networks"
         }
     }
 
-    private Network findVpnNetwork() {
-        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        Network[] networks = cm.getAllNetworks();
-        for (Network network : networks) {
-            LinkProperties linkProperties = cm.getLinkProperties(network);
-            List<LinkAddress> addresses = linkProperties.getLinkAddresses();
-            for (LinkAddress addr : addresses) {
-                if (addr.getAddress().equals(VPN_ADDRESS)) {
-                    return network;
-                }
+    private Network findPhysicalNetwork() {
+        ConnectivityManager cm = (ConnectivityManager)
+            getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm == null) {
+            return null;
+        }
+        for (Network network : cm.getAllNetworks()) {
+            NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+            if (caps == null) {
+                continue;
             }
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                continue;
+            }
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                continue;
+            }
+            return network;
         }
         return null;
     }
