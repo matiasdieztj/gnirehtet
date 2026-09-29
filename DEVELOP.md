@@ -142,3 +142,76 @@ git push --tags
 ```
 
 GitHub Actions builds and attaches binaries for all 5 targets.
+
+## Known limitation: Android VpnService and the default network (Android 12+)
+
+### Summary
+
+In strict airplane mode (WiFi OFF, cellular OFF, USB only), gnirehtet routes
+IP traffic correctly but apps that use
+`ConnectivityManager.registerDefaultNetworkCallback()` hang at startup.
+This is an **AOSP `NetworkRanker` limitation**, not a gnirehtet bug.
+
+### Evidence
+
+**IP traffic works in airplane mode.** Running `ping -c 3 1.1.1.1` through
+gnirehtet (USB only, no WiFi/cellular):
+
+    64 bytes from 1.1.1.1: icmp_seq=1 ttl=64 time=1.79 ms
+    64 bytes from 1.1.1.1: icmp_seq=2 ttl=64 time=1.83 ms
+    64 bytes from 1.1.1.1: icmp_seq=3 ttl=64 time=1.49 ms
+
+`TTL=64` with `<2 ms` latency is the synthetic ICMP echo reply from
+`icmp_handler.rs` — the packet never left the host. The VPN routes traffic.
+
+**But the default network is absent.** Comparing `dumpsys connectivity`:
+
+| Field                        | WiFi ON              | Airplane mode        |
+|------------------------------|----------------------|----------------------|
+| VPN Transports               | `WIFI\|VPN`          | `VPN` only           |
+| VPN UnderlyingNetworks       | `[174]`              | `[]`                 |
+| Active default network       | `174` (WiFi)         | `none`               |
+| Capabilities                 | `INTERNET&VALIDATED` | `INTERNET&VALIDATED` |
+
+Capabilities are identical. The difference is the transport: AOSP's
+`NetworkRanker` requires a non-VPN transport for default-network eligibility.
+A VPN-only transport is **never** promoted to default, regardless of
+capabilities.
+
+### Affected apps
+
+Any app that gates its network operations on `registerDefaultNetworkCallback`
+or `getActiveNetwork()`:
+
+- **fast.com** — stuck at logo, never progresses
+- **Ookla Speedtest** — works only when WiFi/cellular is also present
+- **WiFiman** — download works; upload may timeout
+
+Apps that use raw sockets or `VpnService` file descriptors directly are
+unaffected.
+
+### Why it cannot be fixed
+
+- `setUnderlyingNetworks(null)` and `setUnderlyingNetworks(new Network[0])`
+  are functionally identical on Android 12. Neither promotes a VPN-only
+  transport.
+- The only workaround would be reflection over private `ConnectivityManager`
+  APIs, which break every Android release and are hardened against exactly
+  this use case.
+
+### Workaround
+
+Connect the device to **any** WiFi network (with or without internet).
+The WiFi provides the default-network slot; gnirehtet's routes still
+intercept all app traffic via the USB tunnel.
+
+For environments without WiFi, create a hotspot on the host PC and connect
+the device to it. The hotspot does not need internet access — it only needs
+to provide the `Active default network` slot.
+
+### References
+
+- `VpnService.setUnderlyingNetworks()`:
+  https://developer.android.com/reference/android.net/VpnService#setUnderlyingNetworks(android.net.Network[])
+- AOSP `NetworkRanker`:
+  https://cs.android.com/android/platform/superproject/+/main:packages/modules/Connectivity/service/src/com/android/server/connectivity/NetworkRanker.java
