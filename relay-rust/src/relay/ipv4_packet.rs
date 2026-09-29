@@ -162,8 +162,7 @@ impl<'a> Ipv4Packet<'a> {
             // payload_index is relative to transport
             let payload_index = transport_header_data.header_length() as usize;
             let (ipv4_header_slice, transport_slice) = self.raw.split_at_mut(transport_index);
-            let (transport_header_slice, payload_slice) =
-                transport_slice.split_at_mut(payload_index);
+            let (transport_header_slice, payload_slice) = transport_slice.split_at_mut(payload_index);
             let ipv4_header = self.ipv4_header_data.bind_mut(ipv4_header_slice);
             let transport_header = transport_header_data.bind_mut(transport_header_slice);
             (ipv4_header, Some((transport_header, payload_slice)))
@@ -185,13 +184,11 @@ impl<'a> Ipv4Packet<'a> {
     }
 
     pub fn payload(&self) -> Option<&[u8]> {
-        self.transport_header_data
-            .as_ref()
-            .map(|transport_header_data| {
-                let range = self.ipv4_header_data.header_length() as usize
-                    + transport_header_data.header_length() as usize..;
-                &self.raw[range]
-            })
+        self.transport_header_data.as_ref().map(|transport_header_data| {
+            let range =
+                self.ipv4_header_data.header_length() as usize + transport_header_data.header_length() as usize..;
+            &self.raw[range]
+        })
     }
 
     pub fn compute_checksums(&mut self) {
@@ -247,9 +244,7 @@ mod tests {
             assert_eq!(0x12345678, ipv4_header.source());
             assert_eq!(0x42424242, ipv4_header.destination());
 
-            if let Some(&TransportHeaderData::Udp(ref udp_header)) =
-                ipv4_packet.transport_header_data()
-            {
+            if let Some(&TransportHeaderData::Udp(ref udp_header)) = ipv4_packet.transport_header_data() {
                 assert_eq!(1234, udp_header.source_port());
                 assert_eq!(5678, udp_header.destination_port());
             } else {

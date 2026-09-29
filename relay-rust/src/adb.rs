@@ -49,11 +49,12 @@ pub fn ensure_adb() {
 
     // 2. Try running `adb version`
     if let Ok(status) = process::Command::new("adb").arg("version").status()
-        && status.success() {
-            info!(target: TAG, "ADB found in PATH");
-            let _ = ADB_PATH.set("adb".to_string());
-            return;
-        }
+        && status.success()
+    {
+        info!(target: TAG, "ADB found in PATH");
+        let _ = ADB_PATH.set("adb".to_string());
+        return;
+    }
 
     // 3. Download and extract ADB automatically
     info!(target: TAG, "ADB not found in PATH, downloading...");
@@ -116,8 +117,7 @@ fn download_and_extract_adb() -> Result<String, String> {
     );
 
     let tmp_dir = std::env::temp_dir().join("gnirehtet-adb");
-    std::fs::create_dir_all(&tmp_dir)
-        .map_err(|e| format!("Failed to create temp dir {}: {}", tmp_dir.display(), e))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create temp dir {}: {}", tmp_dir.display(), e))?;
     let zip_path = tmp_dir.join("platform-tools-latest.zip");
 
     info!(target: TAG, "Downloading ADB from {}...", url);
@@ -176,11 +176,7 @@ fn is_command_available(cmd: &str) -> bool {
 }
 
 /// Extract only the ADB-related files from the platform-tools zip.
-fn extract_adb(
-    zip_path: &std::path::Path,
-    dest_dir: &std::path::Path,
-    platform: &str,
-) -> Result<(), String> {
+fn extract_adb(zip_path: &std::path::Path, dest_dir: &std::path::Path, platform: &str) -> Result<(), String> {
     let files_to_extract: Vec<&str> = if platform == "windows" {
         vec![
             "platform-tools/adb.exe",
@@ -192,10 +188,7 @@ fn extract_adb(
     };
 
     // unzip -o <zip> <file1> <file2> ... -d <dest>
-    let mut args = vec![
-        "-o".to_string(),
-        zip_path.to_string_lossy().to_string(),
-    ];
+    let mut args = vec!["-o".to_string(), zip_path.to_string_lossy().to_string()];
     for f in &files_to_extract {
         args.push(f.to_string());
     }
@@ -218,7 +211,10 @@ pub fn get_adb_path() -> String {
     ADB_PATH.get().cloned().unwrap_or_else(|| {
         // Backward-compatible fallback if ensure_adb() wasn't called.
         if let Some(env_adb) = std::env::var_os("ADB") {
-            env_adb.into_string().unwrap_or_else(|_| { warn!(target: TAG, "Invalid ADB value"); "adb".to_string() })
+            env_adb.into_string().unwrap_or_else(|_| {
+                warn!(target: TAG, "Invalid ADB value");
+                "adb".to_string()
+            })
         } else {
             "adb".to_string()
         }
@@ -227,7 +223,10 @@ pub fn get_adb_path() -> String {
 
 pub fn get_apk_path() -> String {
     if let Some(env_adb) = std::env::var_os("GNIREHTET_APK") {
-        env_adb.into_string().unwrap_or_else(|_| { warn!(target: TAG, "Invalid GNIREHTET_APK value"); "gnirehtet.apk".to_string() })
+        env_adb.into_string().unwrap_or_else(|_| {
+            warn!(target: TAG, "Invalid GNIREHTET_APK value");
+            "gnirehtet.apk".to_string()
+        })
     } else {
         "gnirehtet.apk".to_string()
     }
@@ -245,10 +244,7 @@ pub fn create_adb_args<S: Into<String>>(serial: Option<&str>, args: Vec<S>) -> V
     command
 }
 
-pub fn exec_adb<S: Into<String>>(
-    serial: Option<&str>,
-    args: Vec<S>,
-) -> Result<(), CommandExecutionError> {
+pub fn exec_adb<S: Into<String>>(serial: Option<&str>, args: Vec<S>) -> Result<(), CommandExecutionError> {
     let adb_args = create_adb_args(serial, args);
     let adb = get_adb_path();
     debug!(target: TAG, "Execute: {:?} {:?}", adb, adb_args);
@@ -270,10 +266,7 @@ pub fn exec_adb<S: Into<String>>(
 
 pub fn must_install_client(serial: Option<&str>) -> Result<bool, CommandExecutionError> {
     info!(target: TAG, "Checking gnirehtet client...");
-    let args = create_adb_args(
-        serial,
-        vec!["shell", "dumpsys", "package", "com.genymobile.gnirehtet"],
-    );
+    let args = create_adb_args(serial, vec!["shell", "dumpsys", "package", "com.genymobile.gnirehtet"]);
     let adb = get_adb_path();
     debug!(target: TAG, "Execute: {:?} {:?}", adb, args);
     match process::Command::new(&adb).args(&args[..]).output() {

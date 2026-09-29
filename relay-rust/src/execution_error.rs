@@ -62,30 +62,18 @@ impl CommandExecutionError {
                 }
             }
             CommandExecutionError::ProcessStatus(err) => match err.termination {
-                Termination::Value(1) => {
-                    "Check that `gnirehtet.apk` is valid and the device screen is unlocked"
-                }
-                Termination::Value(_) => {
-                    "Restart ADB: `adb kill-server && adb start-server`"
-                }
+                Termination::Value(1) => "Check that `gnirehtet.apk` is valid and the device screen is unlocked",
+                Termination::Value(_) => "Restart ADB: `adb kill-server && adb start-server`",
                 #[cfg(unix)]
-                Termination::Signal(_) => {
-                    "ADB was killed by the system. Restart the daemon"
-                }
+                Termination::Signal(_) => "ADB was killed by the system. Restart the daemon",
             },
             CommandExecutionError::Io(err) => match err.kind() {
                 io::ErrorKind::NotFound => {
                     "APK not found. Download from releases, build with `make apk`, or set GNIREHTET_APK"
                 }
-                io::ErrorKind::ConnectionRefused => {
-                    "Port in use or no device connected. Use `-p PORT` to change it"
-                }
-                io::ErrorKind::TimedOut => {
-                    "High latency or device disconnected. Check the cable"
-                }
-                io::ErrorKind::ConnectionReset => {
-                    "Connection reset. Cable issue or device unplugged"
-                }
+                io::ErrorKind::ConnectionRefused => "Port in use or no device connected. Use `-p PORT` to change it",
+                io::ErrorKind::TimedOut => "High latency or device disconnected. Check the cable",
+                io::ErrorKind::ConnectionReset => "Connection reset. Cable issue or device unplugged",
                 _ => "Check USB connection and try again",
             },
         }

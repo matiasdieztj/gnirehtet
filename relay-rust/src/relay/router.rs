@@ -100,12 +100,8 @@ impl Router {
                     warn!(target: TAG, "Dropping packet: no transport header data");
                     return;
                 };
-                ConnectionId::from_headers(
-                    &ip_header_data,
-                    transport_header_data,
-                    self.client_label.clone(),
-                )
-        };
+                ConnectionId::from_headers(&ip_header_data, transport_header_data, self.client_label.clone())
+            };
             match self.connections.entry(id.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let mut connection = entry.get().borrow_mut();
@@ -130,9 +126,7 @@ impl Router {
                             // para TCP el SYN va sin payload y el handshake es sintético, pero
                             // para UDP el primer paquete ES el payload. Sin esta llamada, la
                             // primera consulta DNS (o el primer probe QUIC) se descarta.
-                            connection
-                                .borrow_mut()
-                                .send_to_network(client_channel, ip_packet);
+                            connection.borrow_mut().send_to_network(client_channel, ip_packet);
                             entry.insert(connection);
                         }
                         Err(err) => {
@@ -167,8 +161,7 @@ impl Router {
         ip_packet: &IpPacket,
     ) -> io::Result<Rc<RefCell<dyn Connection>>> {
         let (ip_header, transport_header) = ip_packet.headers();
-        let transport_header =
-            transport_header.ok_or_else(|| io::Error::other("No transport header"))?;
+        let transport_header = transport_header.ok_or_else(|| io::Error::other("No transport header"))?;
         match id.protocol() {
             Protocol::Tcp => Ok(TcpConnection::create(
                 id,

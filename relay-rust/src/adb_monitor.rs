@@ -177,9 +177,7 @@ impl AdbMonitor {
 
     /// Run `adb devices -l` and return only those serials whose transport is USB.
     fn filter_usb_only(&self, serials: &[String]) -> Vec<String> {
-        let output = process::Command::new("adb")
-            .args(["devices", "-l"])
-            .output();
+        let output = process::Command::new("adb").args(["devices", "-l"]).output();
         let stdout = match output {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout[..]).to_string(),
             _ => {
@@ -219,9 +217,10 @@ impl AdbMonitor {
                 let mut split = line.split_whitespace();
                 if let Some(serial) = split.next()
                     && let Some(state) = split.next()
-                    && state == "device" {
-                        return Some(serial.to_string());
-                    }
+                    && state == "device"
+                {
+                    return Some(serial.to_string());
+                }
                 None
             })
             .collect()
@@ -253,10 +252,7 @@ impl AdbMonitor {
 
     fn start_adb_daemon() -> bool {
         info!(target: TAG, "Restarting adb daemon");
-        match process::Command::new("adb")
-            .args(["start-server"])
-            .status()
-        {
+        match process::Command::new("adb").args(["start-server"]).status() {
             Ok(exit_status) => {
                 if exit_status.success() {
                     true
@@ -316,10 +312,7 @@ mod tests {
         buf.read_from(&mut cursor).unwrap();
 
         let packet = AdbMonitor::read_packet(&mut buf).unwrap().unwrap();
-        assert_eq!(
-            "0123456789ABCDEF\tdevice\nFEDCBA9876543210\tdevice\n",
-            packet
-        );
+        assert_eq!("0123456789ABCDEF\tdevice\nFEDCBA9876543210\tdevice\n", packet);
     }
 
     #[test]

@@ -69,10 +69,7 @@ impl DatagramBuffer {
     }
 
     pub fn write_to<S: DatagramSender>(&mut self, destination: &mut S) -> io::Result<()> {
-        assert!(
-            !self.is_empty(),
-            "DatagramBuffer.write_to() called while empty"
-        );
+        assert!(!self.is_empty(), "DatagramBuffer.write_to() called while empty");
         let length = self.read_length() as usize;
         let source_slice = &self.buf[self.tail..self.tail + length];
         self.tail += length;
@@ -85,9 +82,7 @@ impl DatagramBuffer {
                 target: TAG,
                 "Cannot write the whole datagram to the buffer (only {}/{})", w, length
             );
-            return Err(io::Error::other(
-                "Cannot write the whole datagram",
-            ));
+            return Err(io::Error::other("Cannot write the whole datagram"));
         }
         Ok(())
     }
@@ -100,9 +95,7 @@ impl DatagramBuffer {
             MAX_DATAGRAM_LENGTH
         );
         if !self.has_enough_space_for(length) {
-            return Err(io::Error::other(
-                "Datagram buffer is full",
-            ));
+            return Err(io::Error::other("Datagram buffer is full"));
         }
         self.write_length(length as u16);
         let target_slice = &mut self.buf[self.head..self.head + length];

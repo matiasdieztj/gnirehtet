@@ -32,10 +32,7 @@ pub struct Packetizer {
 }
 
 impl Packetizer {
-    pub fn new(
-        reference_ip_header: &IpHeader,
-        reference_transport_header: &TransportHeader,
-    ) -> Self {
+    pub fn new(reference_ip_header: &IpHeader, reference_transport_header: &TransportHeader) -> Self {
         let mut buffer = Box::new([0; MAX_PACKET_LENGTH]);
 
         let transport_index = reference_ip_header.header_length() as usize;
@@ -125,8 +122,7 @@ impl Packetizer {
         let total_length = self.payload_index as u16 + payload_length;
 
         self.ip_header_mut().set_total_length(total_length);
-        self.transport_header_mut()
-            .set_payload_length(payload_length);
+        self.transport_header_mut().set_payload_length(payload_length);
 
         let ip_data = self.ip_header_data.clone();
 
@@ -262,10 +258,7 @@ mod tests {
         let mut packetizer = Packetizer::new(&ip_header, &transport_header);
 
         {
-            let packet = packetizer
-                .packetize_read(&mut cursor, Some(2))
-                .unwrap()
-                .unwrap();
+            let packet = packetizer.packetize_read(&mut cursor, Some(2)).unwrap().unwrap();
             match &packet {
                 IpPacket::V4(p) => {
                     assert_eq!(30, p.ipv4_header_data().total_length());
@@ -276,10 +269,7 @@ mod tests {
         }
 
         {
-            let packet = packetizer
-                .packetize_read(&mut cursor, Some(3))
-                .unwrap()
-                .unwrap();
+            let packet = packetizer.packetize_read(&mut cursor, Some(3)).unwrap().unwrap();
             match &packet {
                 IpPacket::V4(p) => {
                     assert_eq!(31, p.ipv4_header_data().total_length());
@@ -290,10 +280,7 @@ mod tests {
         }
 
         {
-            let packet = packetizer
-                .packetize_read(&mut cursor, Some(1024))
-                .unwrap()
-                .unwrap();
+            let packet = packetizer.packetize_read(&mut cursor, Some(1024)).unwrap().unwrap();
             match &packet {
                 IpPacket::V4(p) => {
                     assert_eq!(31, p.ipv4_header_data().total_length());

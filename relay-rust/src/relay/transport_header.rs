@@ -17,7 +17,7 @@
 use super::ip_header::IpHeaderData;
 use super::ipv4_header::Protocol;
 use super::tcp_header::{TcpHeader, TcpHeaderData, TcpHeaderMut};
-use super::udp_header::{UdpHeader, UdpHeaderData, UdpHeaderMut, UDP_HEADER_LENGTH};
+use super::udp_header::{UDP_HEADER_LENGTH, UdpHeader, UdpHeaderData, UdpHeaderMut};
 
 pub enum TransportHeader<'a> {
     Tcp(TcpHeader<'a>),
@@ -92,12 +92,8 @@ impl<'a> TransportHeader<'a> {
 impl<'a> TransportHeaderMut<'a> {
     pub fn new(raw: &'a mut [u8], data: &'a mut TransportHeaderData) -> Self {
         match *data {
-            TransportHeaderData::Tcp(ref mut tcp_header_data) => {
-                tcp_header_data.bind_mut(raw).into()
-            }
-            TransportHeaderData::Udp(ref mut udp_header_data) => {
-                udp_header_data.bind_mut(raw).into()
-            }
+            TransportHeaderData::Tcp(ref mut tcp_header_data) => tcp_header_data.bind_mut(raw).into(),
+            TransportHeaderData::Udp(ref mut udp_header_data) => udp_header_data.bind_mut(raw).into(),
         }
     }
 }
@@ -152,11 +148,7 @@ macro_rules! transport_header_common {
 }
 
 transport_header_common!(TransportHeader, &'a [u8], &'a TransportHeaderData);
-transport_header_common!(
-    TransportHeaderMut,
-    &'a mut [u8],
-    &'a mut TransportHeaderData
-);
+transport_header_common!(TransportHeaderMut, &'a mut [u8], &'a mut TransportHeaderData);
 
 // additional methods for the mutable version
 #[allow(dead_code)]
@@ -181,9 +173,7 @@ impl<'a> TransportHeaderMut<'a> {
     pub fn set_payload_length(&mut self, payload_length: u16) {
         #[allow(clippy::single_match)]
         match *self {
-            TransportHeaderMut::Udp(ref mut udp_header) => {
-                udp_header.set_payload_length(payload_length)
-            }
+            TransportHeaderMut::Udp(ref mut udp_header) => udp_header.set_payload_length(payload_length),
             _ => (), // TCP does not store its payload length
         }
     }
@@ -191,12 +181,8 @@ impl<'a> TransportHeaderMut<'a> {
     #[inline]
     pub fn update_checksum(&mut self, ip_header_data: &IpHeaderData, payload: &[u8]) {
         match *self {
-            TransportHeaderMut::Tcp(ref mut tcp_header) => {
-                tcp_header.update_checksum(ip_header_data, payload)
-            }
-            TransportHeaderMut::Udp(ref mut udp_header) => {
-                udp_header.update_checksum(ip_header_data, payload)
-            }
+            TransportHeaderMut::Tcp(ref mut tcp_header) => tcp_header.update_checksum(ip_header_data, payload),
+            TransportHeaderMut::Udp(ref mut udp_header) => udp_header.update_checksum(ip_header_data, payload),
         }
     }
 }

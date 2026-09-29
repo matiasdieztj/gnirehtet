@@ -59,9 +59,7 @@ impl IpHeaderData {
 
     pub fn destination(&self) -> IpAddr {
         match self {
-            IpHeaderData::V4(v4) => {
-                IpAddr::V4(std::net::Ipv4Addr::from(v4.destination().to_be_bytes()))
-            }
+            IpHeaderData::V4(v4) => IpAddr::V4(std::net::Ipv4Addr::from(v4.destination().to_be_bytes())),
             IpHeaderData::V6(v6) => IpAddr::V6(v6.destination()),
         }
     }

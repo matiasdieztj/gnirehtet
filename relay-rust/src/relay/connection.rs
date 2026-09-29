@@ -7,9 +7,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 
 use super::client::ClientChannel;
-use super::ipv4_header::Protocol;
 use super::ip_header::IpHeaderData;
 use super::ip_packet::IpPacket;
+use super::ipv4_header::Protocol;
 use super::net;
 use super::transport_header::TransportHeaderData;
 
@@ -18,11 +18,7 @@ const LOCALHOST_FORWARD_V4: u32 = 0x0A_00_02_02; // 10.0.2.2
 pub trait Connection {
     #[allow(dead_code)]
     fn id(&self) -> &ConnectionId;
-    fn send_to_network(
-        &mut self,
-        client_channel: &mut ClientChannel,
-        ip_packet: &IpPacket,
-    );
+    fn send_to_network(&mut self, client_channel: &mut ClientChannel, ip_packet: &IpPacket);
     fn close(&mut self);
     fn is_expired(&self) -> bool;
     fn is_closed(&self) -> bool;

@@ -58,10 +58,7 @@ where
     R: io::Read + 'a,
 {
     pub fn new(read: &'a mut R, max_chunk_size: Option<usize>) -> Self {
-        Self {
-            read,
-            max_chunk_size,
-        }
+        Self { read, max_chunk_size }
     }
 }
 

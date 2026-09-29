@@ -174,10 +174,7 @@ impl UdpConnection {
         if made_progress {
             Ok(())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Connection would block",
-            ))
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "Connection would block"))
         }
     }
 

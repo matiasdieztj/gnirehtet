@@ -75,10 +75,7 @@ impl ClientChannel {
         let mut buffer = match self.buffer.try_borrow_mut() {
             Ok(b) => b,
             Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "client buffer busy",
-                ));
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "client buffer busy"));
             }
         };
         if ip_packet.length() as usize <= buffer.remaining() {
@@ -119,9 +116,8 @@ impl Client {
             None => format!("#{}", id),
         };
 
-        let buffer: SharedBuffer =
-            Rc::new(RefCell::new(StreamBuffer::new(64 * MAX_PACKET_LENGTH)));
-        
+        let buffer: SharedBuffer = Rc::new(RefCell::new(StreamBuffer::new(64 * MAX_PACKET_LENGTH)));
+
         let mut router = Router::new();
         router.set_buffer(buffer.clone());
         router.set_client_label(&label);
@@ -173,10 +169,7 @@ impl Client {
         let mut buffer = match self.network_to_client.try_borrow_mut() {
             Ok(b) => b,
             Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "client buffer busy",
-                ));
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "client buffer busy"));
             }
         };
         if ip_packet.length() as usize <= buffer.remaining() {
@@ -262,7 +255,7 @@ impl Client {
         // Assign client ID and send it to the device first (device expects relay to write first)
         static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
+
         // Human-readable label used in log messages. Includes the ADB serial
         // when the relay was able to correlate this connection with a device.
         let label = match &serial {

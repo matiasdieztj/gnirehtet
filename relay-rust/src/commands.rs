@@ -19,10 +19,10 @@ use std::thread;
 use std::time::Duration;
 
 use crate::adb::{ensure_adb, exec_adb, get_apk_path, must_install_client};
-use crate::execution_error::{Cmd, CommandExecutionError, ProcessIoError, ProcessStatusError};
 use crate::adb_monitor::AdbMonitor;
-use relaylib::relay::tcp_connection;
+use crate::execution_error::{Cmd, CommandExecutionError, ProcessIoError, ProcessStatusError};
 use relaylib::relay::serial_registry;
+use relaylib::relay::tcp_connection;
 
 const TAG: &str = "Main";
 
@@ -73,12 +73,7 @@ pub fn detect_system_dns() -> Vec<String> {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let servers: Vec<String> = stdout
                 .split_whitespace()
-                .filter(|s| {
-                    !s.is_empty()
-                        && *s != "127.0.0.1"
-                        && *s != "::1"
-                        && *s != "0.0.0.0"
-                })
+                .filter(|s| !s.is_empty() && *s != "127.0.0.1" && *s != "::1" && *s != "0.0.0.0")
                 .map(|s| s.to_string())
                 .collect();
             if !servers.is_empty() {
@@ -104,9 +99,10 @@ pub fn detect_mtu() -> u16 {
             // Parse "default via X dev Y ... mtu N"
             for word in stdout.split_whitespace() {
                 if let Some(mtu_str) = word.strip_prefix("mtu")
-                    && let Ok(mtu) = mtu_str.trim().parse::<u16>() {
-                        return mtu.max(1280); // minimum MTU for IPv6
-                    }
+                    && let Ok(mtu) = mtu_str.trim().parse::<u16>()
+                {
+                    return mtu.max(1280); // minimum MTU for IPv6
+                }
             }
         }
     }
@@ -167,11 +163,7 @@ pub fn cmd_stop(serial: Option<&str>) -> Result<(), CommandExecutionError> {
 pub fn cmd_tunnel(serial: Option<&str>, port: u16) -> Result<(), CommandExecutionError> {
     exec_adb(
         serial,
-        vec![
-            "reverse",
-            "localabstract:gnirehtet",
-            format!("tcp:{}", port).as_str(),
-        ],
+        vec!["reverse", "localabstract:gnirehtet", format!("tcp:{}", port).as_str()],
     )
 }
 
@@ -192,10 +184,7 @@ fn effective_serial(serial: Option<&str>) -> Option<String> {
         return Some(s.to_string());
     }
     let adb = crate::adb::get_adb_path();
-    let out = std::process::Command::new(&adb)
-        .args(["devices"])
-        .output()
-        .ok()?;
+    let out = std::process::Command::new(&adb).args(["devices"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -316,7 +305,18 @@ pub fn cmd_autostart(
         let dns_servers = start_dns_servers.as_ref().map(String::as_ref);
         let routes = start_routes.as_ref().map(String::as_ref);
         let socks5 = start_socks5.as_ref().map(String::as_ref);
-        async_start(Some(serial), dns_servers, routes, port, None, None, mtu, &[], &[], socks5)
+        async_start(
+            Some(serial),
+            dns_servers,
+            routes,
+            port,
+            None,
+            None,
+            mtu,
+            &[],
+            &[],
+            socks5,
+        )
     }));
     adb_monitor.set_usb_only(!allow_wifi);
     adb_monitor.monitor();
@@ -351,7 +351,18 @@ fn async_start(
         let proxy = start_proxy.as_ref().map(String::as_ref);
         let exclusions = start_exclusions.as_ref().map(String::as_ref);
         let socks5 = start_socks5.as_ref().map(String::as_ref);
-        if let Err(err) = cmd_start(serial, dns_servers, routes, port, proxy, exclusions, mtu, &allow_apps_owned, &deny_apps_owned, socks5) {
+        if let Err(err) = cmd_start(
+            serial,
+            dns_servers,
+            routes,
+            port,
+            proxy,
+            exclusions,
+            mtu,
+            &allow_apps_owned,
+            &deny_apps_owned,
+            socks5,
+        ) {
             crate::execution_error::print_error(&err);
         }
     });
@@ -372,15 +383,25 @@ pub fn cmd_run(
     socks5: Option<&str>,
 ) -> Result<(), CommandExecutionError> {
     if let Some(proxy) = socks5
-        && let Ok(addr) = proxy.parse::<std::net::SocketAddr>() {
-            let _ = tcp_connection::SOCKS5_PROXY.set(addr);
-        }
-    async_start(serial, dns_servers, routes, port, proxy, proxy_exclusions, mtu, allow_apps, deny_apps, socks5);
+        && let Ok(addr) = proxy.parse::<std::net::SocketAddr>()
+    {
+        let _ = tcp_connection::SOCKS5_PROXY.set(addr);
+    }
+    async_start(
+        serial,
+        dns_servers,
+        routes,
+        port,
+        proxy,
+        proxy_exclusions,
+        mtu,
+        allow_apps,
+        deny_apps,
+        socks5,
+    );
 
     let ctrlc_serial = serial.map(String::from);
-    let rt = tokio::runtime::Runtime::new().map_err(|e| {
-        CommandExecutionError::Io(std::io::Error::other(e))
-    })?;
+    let rt = tokio::runtime::Runtime::new().map_err(|e| CommandExecutionError::Io(std::io::Error::other(e)))?;
 
     rt.block_on(async {
         tokio::select! {
@@ -410,9 +431,10 @@ pub fn cmd_autorun(
     socks5: Option<&str>,
 ) -> Result<(), CommandExecutionError> {
     if let Some(proxy) = socks5
-        && let Ok(addr) = proxy.parse::<std::net::SocketAddr>() {
-            let _ = tcp_connection::SOCKS5_PROXY.set(addr);
-        }
+        && let Ok(addr) = proxy.parse::<std::net::SocketAddr>()
+    {
+        let _ = tcp_connection::SOCKS5_PROXY.set(addr);
+    }
     {
         let autostart_dns_servers = dns_servers.map(String::from);
         let autostart_routes = routes.map(String::from);

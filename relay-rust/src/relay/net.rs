@@ -19,5 +19,3 @@ use std::net::{IpAddr, SocketAddr};
 pub fn to_socket_addr(ip: IpAddr, port: u16) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
-
-

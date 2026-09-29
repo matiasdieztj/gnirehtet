@@ -84,10 +84,7 @@ enum TcpState {
 impl TcpState {
     #[inline]
     fn is_connected(&self) -> bool {
-        !matches!(
-            self,
-            TcpState::Init | TcpState::SynSent | TcpState::SynReceived
-        )
+        !matches!(self, TcpState::Init | TcpState::SynSent | TcpState::SynReceived)
     }
 
     #[inline]
@@ -115,8 +112,7 @@ impl Tcb {
 
     #[inline]
     fn remaining_client_window(&self) -> u16 {
-        let wrapped_remaining = Wrapping(self.their_acknowledgement_number)
-            + Wrapping(u32::from(self.client_window))
+        let wrapped_remaining = Wrapping(self.their_acknowledgement_number) + Wrapping(u32::from(self.client_window))
             - self.sequence_number;
         let remaining = wrapped_remaining.0;
         if remaining <= u32::from(self.client_window) {
@@ -127,10 +123,7 @@ impl Tcb {
     }
 
     fn numbers(&self) -> String {
-        format!(
-            "(seq={}, ack={})",
-            self.sequence_number, self.acknowledgement_number
-        )
+        format!("(seq={}, ack={})", self.sequence_number, self.acknowledgement_number)
     }
 }
 
@@ -186,15 +179,12 @@ impl TcpConnection {
         shrinked_tcp_header_raw.copy_from_slice(&tcp_header.raw()[..20]);
         let mut shrinked_tcp_header_data = tcp_header.data().clone();
         {
-            let mut shrinked_tcp_header =
-                shrinked_tcp_header_data.bind_mut(&mut shrinked_tcp_header_raw);
+            let mut shrinked_tcp_header = shrinked_tcp_header_data.bind_mut(&mut shrinked_tcp_header_raw);
             shrinked_tcp_header.shrink_options();
             debug_assert_eq!(20, shrinked_tcp_header.header_length());
         }
 
-        let shrinked_transport_header = shrinked_tcp_header_data
-            .bind(&shrinked_tcp_header_raw)
-            .into();
+        let shrinked_transport_header = shrinked_tcp_header_data.bind(&shrinked_tcp_header_raw).into();
 
         let packetizer = Packetizer::new(&ip_header, &shrinked_transport_header);
 
@@ -257,10 +247,7 @@ impl TcpConnection {
     }
 
     /// Connect to a destination through a SOCKS5 proxy.
-    fn connect_via_socks5(
-        proxy: &std::net::SocketAddr,
-        destination: &std::net::SocketAddr,
-    ) -> io::Result<TcpStream> {
+    fn connect_via_socks5(proxy: &std::net::SocketAddr, destination: &std::net::SocketAddr) -> io::Result<TcpStream> {
         use std::io::{Read, Write};
         let mut stream = TcpStream::connect(proxy)?;
         stream.set_nonblocking(false)?;
@@ -287,10 +274,7 @@ impl TcpConnection {
         let mut reply = [0u8; 4];
         stream.read_exact(&mut reply)?;
         if reply[0] != 0x05 || reply[1] != 0x00 {
-            return Err(io::Error::other(format!(
-                "SOCKS5 connect failed: reply={:?}",
-                reply
-            )));
+            return Err(io::Error::other(format!("SOCKS5 connect failed: reply={:?}", reply)));
         }
         let addr_type = reply[3];
         let remaining_len = match addr_type {
@@ -302,10 +286,7 @@ impl TcpConnection {
             }
             0x04 => 16 + 2,
             _ => {
-                return Err(io::Error::other(format!(
-                    "SOCKS5 unknown address type: {}",
-                    addr_type
-                )));
+                return Err(io::Error::other(format!("SOCKS5 unknown address type: {}", addr_type)));
             }
         };
         if remaining_len > 0 {
@@ -345,10 +326,7 @@ impl TcpConnection {
         let mut buf = match buffer.try_borrow_mut() {
             Ok(b) => b,
             Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "client buffer busy",
-                ));
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "client buffer busy"));
             }
         };
         if ip_packet.length() as usize <= buf.remaining() {
@@ -474,10 +452,7 @@ impl TcpConnection {
         if made_progress {
             Ok(())
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Connection would block",
-            ))
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "Connection would block"))
         }
     }
 
@@ -543,8 +518,7 @@ impl TcpConnection {
                 break;
             }
             let remaining_client_window = self.tcb.remaining_client_window();
-            let max_payload_length =
-                Some(cmp::min(remaining_client_window, MAX_PAYLOAD_LENGTH) as usize);
+            let max_payload_length = Some(cmp::min(remaining_client_window, MAX_PAYLOAD_LENGTH) as usize);
             let advertised_window = self.advertised_window();
             Self::update_headers(
                 &mut self.network_to_client,
@@ -557,8 +531,7 @@ impl TcpConnection {
                 .packetize_read(&mut self.stream, max_payload_length)
             {
                 Ok(Some(ip_packet)) => {
-                    self.bytes_received +=
-                        ip_packet.payload().map(|p| p.len() as u64).unwrap_or(0);
+                    self.bytes_received += ip_packet.payload().map(|p| p.len() as u64).unwrap_or(0);
                     match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
                         Ok(()) => {
                             let len = ip_packet.payload().unwrap().len();
@@ -629,13 +602,8 @@ impl TcpConnection {
     /// to call from within `poll_self()`.
     fn send_empty_packet_to_client(&mut self, flags: u16) {
         let window = self.advertised_window();
-        let ip_packet = Self::create_empty_response_packet(
-            &self.id,
-            &mut self.network_to_client,
-            &self.tcb,
-            flags,
-            window,
-        );
+        let ip_packet =
+            Self::create_empty_response_packet(&self.id, &mut self.network_to_client, &self.tcb, flags, window);
         match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
             Ok(()) => {
                 cx_debug!(
@@ -824,11 +792,7 @@ impl TcpConnection {
         }
     }
 
-    fn handle_duplicate_syn(
-        &mut self,
-        client_channel: &mut ClientChannel,
-        ip_packet: &IpPacket,
-    ) {
+    fn handle_duplicate_syn(&mut self, client_channel: &mut ClientChannel, ip_packet: &IpPacket) {
         let tcp_header = Self::tcp_header_of_packet(ip_packet);
         let their_sequence_number = tcp_header.sequence_number();
         if self.tcb.state == TcpState::SynSent {
@@ -943,13 +907,8 @@ impl TcpConnection {
     /// arrives from the device, i.e. when no buffer borrow conflict exists).
     fn reply_empty_packet_to_client(&mut self, client_channel: &mut ClientChannel, flags: u16) {
         let window = self.advertised_window();
-        let ip_packet = Self::create_empty_response_packet(
-            &self.id,
-            &mut self.network_to_client,
-            &self.tcb,
-            flags,
-            window,
-        );
+        let ip_packet =
+            Self::create_empty_response_packet(&self.id, &mut self.network_to_client, &self.tcb, flags, window);
         let _ = client_channel.send_to_client(&ip_packet);
     }
 

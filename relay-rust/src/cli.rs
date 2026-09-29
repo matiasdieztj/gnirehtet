@@ -216,7 +216,19 @@ impl Commands {
                 allow_app,
                 deny_app,
                 socks5,
-            } => commands::cmd_run(serial.as_deref(), dns.as_deref(), routes.as_deref(), *port, proxy.as_deref(), proxy_exclusions.as_deref(), *stop_on_disconnect, *mtu, allow_app, deny_app, socks5.as_deref()),
+            } => commands::cmd_run(
+                serial.as_deref(),
+                dns.as_deref(),
+                routes.as_deref(),
+                *port,
+                proxy.as_deref(),
+                proxy_exclusions.as_deref(),
+                *stop_on_disconnect,
+                *mtu,
+                allow_app,
+                deny_app,
+                socks5.as_deref(),
+            ),
             Commands::Autorun {
                 dns,
                 routes,
@@ -225,7 +237,15 @@ impl Commands {
                 mtu,
                 allow_wifi,
                 socks5,
-            } => commands::cmd_autorun(dns.as_deref(), routes.as_deref(), *port, *stop_on_disconnect, *mtu, *allow_wifi, socks5.as_deref()),
+            } => commands::cmd_autorun(
+                dns.as_deref(),
+                routes.as_deref(),
+                *port,
+                *stop_on_disconnect,
+                *mtu,
+                *allow_wifi,
+                socks5.as_deref(),
+            ),
             Commands::Start {
                 serial,
                 dns,
@@ -249,21 +269,28 @@ impl Commands {
                 deny_app,
                 socks5.as_deref(),
             ),
-            Commands::Autostart { dns, routes, port, mtu, allow_wifi, socks5 } => {
-                commands::cmd_autostart(dns.as_deref(), routes.as_deref(), *port, *mtu, *allow_wifi, socks5.as_deref())
-            }
+            Commands::Autostart {
+                dns,
+                routes,
+                port,
+                mtu,
+                allow_wifi,
+                socks5,
+            } => commands::cmd_autostart(
+                dns.as_deref(),
+                routes.as_deref(),
+                *port,
+                *mtu,
+                *allow_wifi,
+                socks5.as_deref(),
+            ),
             Commands::Stop { serial } => commands::cmd_stop(serial.as_deref()),
             Commands::Restart {
                 serial,
                 dns,
                 routes,
                 port,
-            } => commands::cmd_restart(
-                serial.as_deref(),
-                dns.as_deref(),
-                routes.as_deref(),
-                *port,
-            ),
+            } => commands::cmd_restart(serial.as_deref(), dns.as_deref(), routes.as_deref(), *port),
             Commands::Tunnel { serial, port } => commands::cmd_tunnel(serial.as_deref(), *port),
             Commands::Relay { port } => commands::cmd_relay(*port),
         }
@@ -297,7 +324,10 @@ pub fn run() {
 
 fn interactive_prompt() {
     eprintln!();
-    eprintln!("gnirehtet {} \u{2014} Reverse tethering for Android", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "gnirehtet {} \u{2014} Reverse tethering for Android",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!();
     loop {
         eprintln!("Choose an action:");
@@ -346,10 +376,9 @@ pub fn get_log_file() -> Option<String> {
     let raw: Vec<String> = std::env::args().collect();
     // Simple manual parsing for --log-file before the subcommand
     for i in 1..raw.len() {
-        if raw[i] == "--log-file"
-            && i + 1 < raw.len() {
-                return Some(raw[i + 1].clone());
-            }
+        if raw[i] == "--log-file" && i + 1 < raw.len() {
+            return Some(raw[i + 1].clone());
+        }
         if raw[i].starts_with("--log-file=") {
             return Some(raw[i]["--log-file=".len()..].to_string());
         }

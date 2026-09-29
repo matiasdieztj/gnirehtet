@@ -17,7 +17,6 @@ const TAG: &str = "DnsCache";
 
 const CACHE_TTL_SECONDS: u64 = 60;
 
-
 /// DNS cache entry with expiry.
 #[derive(Clone)]
 struct CacheEntry {
@@ -86,11 +85,12 @@ impl DnsCache {
             };
 
             if let Some(entry) = cached
-                && entry.expires_at > Instant::now() {
-                    trace!(target: TAG, "DNS cache hit: {:?}", query_name);
-                    let _ = sock.send_to(&entry.response, client_addr).await;
-                    continue;
-                }
+                && entry.expires_at > Instant::now()
+            {
+                trace!(target: TAG, "DNS cache hit: {:?}", query_name);
+                let _ = sock.send_to(&entry.response, client_addr).await;
+                continue;
+            }
 
             // Forward to upstream DNS
             trace!(target: TAG, "DNS cache miss, forwarding: {:?}", query_name);

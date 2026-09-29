@@ -311,18 +311,13 @@ impl<'a> TcpHeaderMut<'a> {
         // pseudo-header checksum (cf rfc793 section 3.1)
         let source = ipv4_header_data.source();
         let destination = ipv4_header_data.destination();
-        let transport_length =
-            ipv4_header_data.total_length() - u16::from(ipv4_header_data.header_length());
+        let transport_length = ipv4_header_data.total_length() - u16::from(ipv4_header_data.header_length());
 
         let header_length = self.header_length();
         debug_assert!(header_length.is_multiple_of(2) && header_length >= 20);
 
         let payload_length = transport_length - u16::from(header_length);
-        debug_assert_eq!(
-            payload_length as usize,
-            payload.len(),
-            "Payload length does not match"
-        );
+        debug_assert_eq!(payload_length as usize, payload.len(), "Payload length does not match");
 
         let mut sum = 6u32; // protocol: TCP = 6
         sum += source >> 16;
@@ -381,11 +376,7 @@ impl<'a> TcpHeaderMut<'a> {
         debug_assert!(header_length.is_multiple_of(2) && header_length >= 20);
 
         let payload_length = transport_length - u16::from(header_length);
-        debug_assert_eq!(
-            payload_length as usize,
-            payload.len(),
-            "Payload length does not match"
-        );
+        debug_assert_eq!(payload_length as usize, payload.len(), "Payload length does not match");
 
         let src = ipv6_header_data.source().octets();
         let dst = ipv6_header_data.destination().octets();
@@ -617,16 +608,7 @@ mod tests {
                 let mut sum: u32 = 0x1234 + 0x5678 + 0xA2A2 + 0x4242 + 0x0006 + 0x0018;
 
                 // header
-                sum += 0x1234
-                    + 0x5678
-                    + 0x0000
-                    + 0x0111
-                    + 0x0000
-                    + 0x0222
-                    + 0x5000
-                    + 0x0000
-                    + 0x0000
-                    + 0x0000;
+                sum += 0x1234 + 0x5678 + 0x0000 + 0x0111 + 0x0000 + 0x0222 + 0x5000 + 0x0000 + 0x0000 + 0x0000;
 
                 // payload
                 sum += 0x1122 + 0xEEFF;
@@ -660,16 +642,7 @@ mod tests {
                 let mut sum: u32 = 0x1234 + 0x5678 + 0xA2A2 + 0x4242 + 0x0006 + 0x0019;
 
                 // header
-                sum += 0x1234
-                    + 0x5678
-                    + 0x0000
-                    + 0x0111
-                    + 0x0000
-                    + 0x0222
-                    + 0x5000
-                    + 0x0000
-                    + 0x0000
-                    + 0x0000;
+                sum += 0x1234 + 0x5678 + 0x0000 + 0x0111 + 0x0000 + 0x0222 + 0x5000 + 0x0000 + 0x0000 + 0x0000;
 
                 // payload
                 sum += 0x1122 + 0xEEFF + 0x8800;
@@ -703,16 +676,7 @@ mod tests {
                 let mut sum: u32 = 0x1234 + 0x5678 + 0xA2A2 + 0x4242 + 0x0006 + 0x0014;
 
                 // header
-                sum += 0x1234
-                    + 0x5678
-                    + 0x0000
-                    + 0x0111
-                    + 0x0000
-                    + 0x0222
-                    + 0x5000
-                    + 0x0000
-                    + 0x0000
-                    + 0x0000;
+                sum += 0x1234 + 0x5678 + 0x0000 + 0x0111 + 0x0000 + 0x0222 + 0x5000 + 0x0000 + 0x0000 + 0x0000;
 
                 while (sum & !0xFFFF) != 0 {
                     sum = (sum & 0xFFFF) + (sum >> 16);

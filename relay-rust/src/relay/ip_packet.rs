@@ -16,7 +16,7 @@
 
 use super::ip_header::{IpHeader, IpHeaderData};
 use super::ipv4_packet::Ipv4Packet;
-use super::ipv6_header::{Ipv6HeaderData, IPV6_HEADER_LENGTH};
+use super::ipv6_header::{IPV6_HEADER_LENGTH, Ipv6HeaderData};
 use super::transport_header::{TransportHeader, TransportHeaderData};
 
 /// Enum that holds either an IPv4 or IPv6 packet.
@@ -74,8 +74,7 @@ impl<'a> Ipv6Packet<'a> {
 
     pub fn headers(&self) -> (super::ipv6_header::Ipv6Header<'_>, Option<TransportHeader<'_>>) {
         if let Some(ref transport_header_data) = self.transport_header_data {
-            let (ipv6_header_slice, transport_slice) =
-                self.raw.split_at(IPV6_HEADER_LENGTH as usize);
+            let (ipv6_header_slice, transport_slice) = self.raw.split_at(IPV6_HEADER_LENGTH as usize);
             let payload_index = transport_header_data.header_length() as usize;
             let transport_header_slice = &transport_slice[..payload_index];
             let ipv6_header = self.ipv6_header_data.bind(ipv6_header_slice);
@@ -110,8 +109,7 @@ impl<'a> Ipv6Packet<'a> {
 
     pub fn payload(&self) -> Option<&[u8]> {
         self.transport_header_data.as_ref().map(|transport_header_data| {
-            let range = IPV6_HEADER_LENGTH as usize
-                + transport_header_data.header_length() as usize..;
+            let range = IPV6_HEADER_LENGTH as usize + transport_header_data.header_length() as usize..;
             &self.raw[range]
         })
     }
@@ -121,10 +119,8 @@ impl<'a> Ipv6Packet<'a> {
         if let Some((mut transport_header, payload)) = {
             if let Some(ref mut transport_header_data) = self.transport_header_data {
                 let payload_index = transport_header_data.header_length() as usize;
-                let (ipv6_header_slice, transport_slice) =
-                    self.raw.split_at_mut(IPV6_HEADER_LENGTH as usize);
-                let (transport_header_slice, payload_slice) =
-                    transport_slice.split_at_mut(payload_index);
+                let (ipv6_header_slice, transport_slice) = self.raw.split_at_mut(IPV6_HEADER_LENGTH as usize);
+                let (transport_header_slice, payload_slice) = transport_slice.split_at_mut(payload_index);
                 let _ipv6_header = self.ipv6_header_data.bind_mut(ipv6_header_slice);
                 let transport_header = transport_header_data.bind_mut(transport_header_slice);
                 Some((transport_header, payload_slice))
