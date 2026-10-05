@@ -117,16 +117,31 @@ pub fn cmd_install(serial: Option<&str>) -> Result<(), CommandExecutionError> {
     let cmd_obj = Cmd::new(adb.clone(), args.clone());
     match std::process::Command::new(&adb).args(&args).output() {
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             if output.status.success() {
                 Ok(())
             } else {
-                if stderr.contains("INSTALL_FAILED") {
-                    eprintln!(
-                        "Tip: Make sure USB debugging is enabled on your device and check for a confirmation dialog on the device screen."
-                    );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(target: TAG, "Install (-r) failed, attempting clean reinstall: {}", stderr.trim());
+                let _ = cmd_uninstall(serial);
+                let retry_args = crate::adb::create_adb_args(serial, vec!["install", &apk_path]);
+                let retry_cmd = Cmd::new(adb.clone(), retry_args.clone());
+                match std::process::Command::new(&adb).args(&retry_args).output() {
+                    Ok(retry_output) => {
+                        if retry_output.status.success() {
+                            info!(target: TAG, "Reinstall succeeded after clean uninstall.");
+                            Ok(())
+                        } else {
+                            let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
+                            if retry_stderr.contains("INSTALL_FAILED") || stderr.contains("INSTALL_FAILED") {
+                                eprintln!(
+                                    "Tip: Make sure USB debugging is enabled on your device and check for a confirmation dialog on the device screen."
+                                );
+                            }
+                            Err(ProcessStatusError::new(retry_cmd, retry_output.status).into())
+                        }
+                    }
+                    Err(err) => Err(ProcessIoError::new(retry_cmd, err).into()),
                 }
-                Err(ProcessStatusError::new(cmd_obj, output.status).into())
             }
         }
         Err(err) => Err(ProcessIoError::new(cmd_obj, err).into()),
