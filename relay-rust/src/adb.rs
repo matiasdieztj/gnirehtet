@@ -273,17 +273,19 @@ pub fn must_install_client(serial: Option<&str>) -> Result<bool, CommandExecutio
         Ok(output) => {
             if output.status.success() {
                 let dumpsys = String::from_utf8_lossy(&output.stdout[..]);
-                if let Some(index) = dumpsys.find("    versionCode=") {
-                    let start = index + 16;
-                    if let Some(end) = dumpsys[start..].find(' ') {
-                        let installed_version_code = &dumpsys[start..start + end];
-                        Ok(installed_version_code != REQUIRED_APK_VERSION_CODE)
-                    } else {
-                        Ok(true)
+                for line in dumpsys.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("versionCode=") {
+                        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                        if let Some(code_part) = parts.first()
+                            && let Some(code) = code_part.strip_prefix("versionCode=")
+                            {
+                                return Ok(code != REQUIRED_APK_VERSION_CODE);
+                            }
                     }
-                } else {
-                    Ok(true)
                 }
+                // Si no se encontró el paquete o no tiene versionCode, requiere instalación
+                Ok(true)
             } else {
                 let cmd = Cmd::new(adb, args);
                 Err(ProcessStatusError::new(cmd, output.status).into())
