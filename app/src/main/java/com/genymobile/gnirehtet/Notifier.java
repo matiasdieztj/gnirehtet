@@ -12,6 +12,18 @@ import android.os.Build;
 
 /**
  * Manage the notification necessary for the foreground service (mandatory since Android O).
+ *
+ * <p>Compatibility notes for API 19 (Android 4.4):
+ *
+ * <ul>
+ *   <li>{@code Notification.Action.Builder} was added in API 20. On API 19, the
+ *       deprecated {@code Notification.Builder.addAction(int, CharSequence, PendingIntent)}
+ *       overload is used instead.</li>
+ *   <li>{@code NotificationChannel} and the channel-aware {@code Notification.Builder}
+ *       constructor require API 26, and are gated.</li>
+ *   <li>{@code PendingIntent.FLAG_IMMUTABLE} requires API 23, and is gated at API 31
+ *       (the only API level where it matters for foreground services).</li>
+ * </ul>
  */
 public class Notifier {
 
@@ -35,7 +47,7 @@ public class Notifier {
             notificationBuilder.setContentText(context.getString(R.string.relay_connected));
             notificationBuilder.setSmallIcon(R.drawable.ic_usb_24dp);
         }
-        notificationBuilder.addAction(createStopAction());
+        addStopAction(notificationBuilder);
         return notificationBuilder.build();
     }
 
@@ -45,6 +57,46 @@ public class Notifier {
             return new Notification.Builder(context, CHANNEL_ID);
         }
         return new Notification.Builder(context);
+    }
+
+    /**
+     * Adds a "Stop VPN" action to the notification.
+     *
+     * <p>Two code paths:
+     * <ul>
+     *   <li>API 20+ ({@code KITKAT_WATCH}): {@code Notification.Action.Builder}</li>
+     *   <li>API 19 ({@code KITKAT}): the deprecated
+     *       {@code Notification.Builder.addAction(int, CharSequence, PendingIntent)}</li>
+     * </ul>
+     *
+     * <p>The deprecated API-16 overload is functionally equivalent for the single
+     * action we add here. The modern builder path is kept because it is the
+     * recommended form on all current Android versions.
+     */
+    private void addStopAction(Notification.Builder notificationBuilder) {
+        Intent stopIntent = GnirehtetService.createStopIntent(context);
+        int flags = PendingIntent.FLAG_ONE_SHOT;
+        if (Build.VERSION.SDK_INT >= 31) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        PendingIntent stopPendingIntent = PendingIntent.getService(context, 0, stopIntent, flags);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
+            // API 20+: Notification.Action.Builder is available.
+            @SuppressWarnings("deprecation")
+            Notification.Action.Builder actionBuilder = new Notification.Action.Builder(
+                    R.drawable.ic_close_24dp,
+                    context.getString(R.string.stop_vpn),
+                    stopPendingIntent);
+            notificationBuilder.addAction(actionBuilder.build());
+        } else {
+            // API 19: Action.Builder does not exist. Use the deprecated overload
+            // that takes (icon, title, intent) directly on the builder.
+            notificationBuilder.addAction(
+                    R.drawable.ic_close_24dp,
+                    context.getString(R.string.stop_vpn),
+                    stopPendingIntent);
+        }
     }
 
     @TargetApi(26)
@@ -80,20 +132,6 @@ public class Notifier {
             Notification notification = createNotification(failure);
             getNotificationManager().notify(NOTIFICATION_ID, notification);
         }
-    }
-
-    private Notification.Action createStopAction() {
-        Intent stopIntent = GnirehtetService.createStopIntent(context);
-        int flags = PendingIntent.FLAG_ONE_SHOT;
-        if (android.os.Build.VERSION.SDK_INT >= 31) {
-            flags |= PendingIntent.FLAG_IMMUTABLE;
-        }
-        PendingIntent stopPendingIntent = PendingIntent.getService(context, 0, stopIntent, flags);
-        // the non-deprecated constructor is not available in API 21
-        @SuppressWarnings("deprecation")
-        Notification.Action.Builder actionBuilder = new Notification.Action.Builder(R.drawable.ic_close_24dp, context.getString(R.string.stop_vpn),
-                stopPendingIntent);
-        return actionBuilder.build();
     }
 
     private NotificationManager getNotificationManager() {

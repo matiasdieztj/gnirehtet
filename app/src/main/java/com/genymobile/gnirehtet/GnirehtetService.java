@@ -120,7 +120,14 @@ public class GnirehtetService extends VpnService {
         if (routes.length == 0) {
             // no routes defined, redirect the whole network traffic
             builder.addRoute("0.0.0.0", 0);
-            builder.addRoute("::0", 0);
+            // IPv6 routes require API 21+. On API 19-20, only IPv4 is routed
+            // through the tunnel — IPv6 traffic will fall through to the
+            // underlying network (or be dropped if none). This is acceptable
+            // because gnirehtet's relay is primarily IPv4-focused, and the
+            // original gnirehtet never supported API 19 at all.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                builder.addRoute("::0", 0);
+            }
         } else {
             for (CIDR route : routes) {
                 builder.addRoute(route.getAddress(), route.getPrefixLength());
@@ -133,14 +140,34 @@ public class GnirehtetService extends VpnService {
             builder.addDnsServer("8.8.8.8");
         } else {
             for (InetAddress dnsServer : dnsServers) {
-                builder.addDnsServer(dnsServer);
+                // addDnsServer(InetAddress) requires API 21+.
+                // On API 19-20, use the String overload which is available
+                // since API 14.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    builder.addDnsServer(dnsServer);
+                } else {
+                    builder.addDnsServer(dnsServer.getHostAddress());
+                }
             }
         }
 
         // non-blocking by default, but FileChannel is not selectable, that's stupid!
-        // so switch to synchronous I/O to avoid polling
-        builder.setBlocking(true);
-        builder.setMtu(config.getMtu());
+        // so switch to synchronous I/O to avoid polling.
+        //
+        // setBlocking() requires API 21+. On API 19-20 the fd returned by
+        // establish() is forced to blocking mode via JNI, right after
+        // establish() returns. See the VpnUtils.setBlockingMode call below.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            builder.setBlocking(true);
+        }
+
+        // setMtu() requires API 21+. On API 19-20 the system uses a default
+        // MTU which may differ from the relay's configured MTU. In practice
+        // this has not caused issues for ICMP/TCP; UDP fragmentation may be
+        // slightly less optimal.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            builder.setMtu(config.getMtu());
+        }
 
         // Indicar al sistema que la VPN no tiene límite de datos (para descargas en Play Store y Galaxy Store)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -158,16 +185,23 @@ public class GnirehtetService extends VpnService {
             }
         }
 
-        // Per-app routing
-        try {
-            for (String pkg : config.getAllowApps()) {
-                builder.addAllowedApplication(pkg);
+        // Per-app routing requires API 21+. On API 19-20 all apps go through
+        // the VPN unconditionally. This is a functional limitation, not a bug:
+        // the platform simply does not offer per-app routing at that API level.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            try {
+                for (String pkg : config.getAllowApps()) {
+                    builder.addAllowedApplication(pkg);
+                }
+                for (String pkg : config.getDenyApps()) {
+                    builder.addDisallowedApplication(pkg);
+                }
+            } catch (NameNotFoundException e) {
+                Log.w(TAG, "Package not found for per-app routing", e);
             }
-            for (String pkg : config.getDenyApps()) {
-                builder.addDisallowedApplication(pkg);
-            }
-        } catch (NameNotFoundException e) {
-            Log.w(TAG, "Package not found for per-app routing", e);
+        } else {
+            Log.d(TAG, "Per-app routing not available on API " + Build.VERSION.SDK_INT
+                    + " (requires API 21+); ignoring allow/deny lists");
         }
 
         vpnInterface = builder.establish();
@@ -175,6 +209,17 @@ public class GnirehtetService extends VpnService {
             Log.w(TAG, "VPN starting failed, please retry");
             // establish() may return null if the application is not prepared or is revoked
             return false;
+        }
+
+        // On API 19-20, builder.setBlocking() does not exist, so the fd is
+        // non-blocking by default. Force it to blocking mode via JNI so that
+        // the Forwarder can use synchronous reads without polling.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            try {
+                VpnUtils.setBlockingMode(vpnInterface.getFd());
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to set VPN fd to blocking mode", t);
+            }
         }
 
         setAsUndernlyingNetwork();
@@ -200,6 +245,14 @@ public class GnirehtetService extends VpnService {
         ConnectivityManager cm = (ConnectivityManager)
             getSystemService(Context.CONNECTIVITY_SERVICE);
         if (cm == null) {
+            return null;
+        }
+        // getAllNetworks() requires API 21+. This method is only called from
+        // setAsUndernlyingNetwork(), which is gated to API 22+, so the branch
+        // is unreachable on pre-21. The explicit check here is for the
+        // Dalvik verifier, which inspects the whole method regardless of the
+        // caller's gate.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
             return null;
         }
         for (Network network : cm.getAllNetworks()) {
@@ -240,7 +293,6 @@ public class GnirehtetService extends VpnService {
             Log.w(TAG, "Cannot close VPN file descriptor", e);
         }
     }
-
 
     private static final class RelayTunnelConnectionStateHandler extends Handler {
 

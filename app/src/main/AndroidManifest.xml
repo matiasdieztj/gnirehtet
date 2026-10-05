@@ -2,13 +2,24 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!--
+      Permissions unknown to API 19 (POST_NOTIFICATIONS, FOREGROUND_SERVICE_DATA_SYNC)
+      are silently ignored by older Android versions. No version gating needed.
+    -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      android:icon="@null" is intentional. gnirehtet is launched via adb
+      commands (com.genymobile.gnirehtet.START), not from a launcher, so it
+      ships without a launcher icon. Do not replace with a mipmap reference
+      unless the project adds the corresponding drawable resources.
+    -->
     <application
+        android:name=".GnirehtetApplication"
         android:allowBackup="false"
         android:icon="@null"
         android:label="@string/app_name"
@@ -23,6 +34,14 @@
             <intent-filter>
                 <action android:name="com.genymobile.gnirehtet.START" />
                 <action android:name="com.genymobile.gnirehtet.STOP" />
+                <!--
+                  CATEGORY_DEFAULT is required for implicit intents to resolve
+                  on Android 4.4 (KitKat). Without it, `am start -a <action>`
+                  fails with "unable to resolve Intent" on API 19, even though
+                  it works on API 21+. The category is ignored by explicit
+                  intents and harmless on modern Android.
+                -->
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
 
