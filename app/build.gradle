@@ -1,17 +1,62 @@
-apply plugin: 'com.android.application'
+// ============================================================================
+// Android app build configuration with two product flavors:
+//
+//   modern  — minSdk 21, full feature set, all Android 12 fixes active.
+//             This is the APK you ship to 99% of users.
+//
+//   legacy  — minSdk 19, Android 4.4 (KitKat) support. Drops the API-21+
+//             conveniences (setBlocking, addDisallowedApplication) in favor
+//             of JNI-based fcntl for blocking mode and legacy notification
+//             builders. Does NOT include the Android 12 fixes, because the
+//             NetworkRanker problem they solve does not exist pre-31.
+//
+// Build both:  ./gradlew assembleRelease
+// Build one:   ./gradlew assembleModernRelease
+//              ./gradlew assembleLegacyRelease
+//
+// Outputs:
+//   android/app/build/outputs/apk/modern/release/app-modern-release.apk
+//   android/app/build/outputs/apk/legacy/release/app-legacy-release.apk
+// ============================================================================
+
+plugins {
+    id 'com.android.application'
+}
 
 android {
-    compileSdk = 35
+    compileSdk = 36
     namespace = 'com.genymobile.gnirehtet'
 
     defaultConfig {
         applicationId = "com.genymobile.gnirehtet"
-        minSdk = 21
-        targetSdk = 35
-        versionCode = 11
+        targetSdk = 36
+        versionCode = 2603
         versionName = "2.6.3"
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // minSdk is declared per-flavor below, NOT here.
+        // Declaring it here would force both flavors to the same value.
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17"
+            }
+        }
     }
+
+    flavorDimensions "minApi"
+    productFlavors {
+        modern {
+            dimension "minApi"
+            minSdk 21
+        }
+        legacy {
+            dimension "minApi"
+            minSdk 19
+        }
+    }
+
     buildTypes {
         release {
             // Sign with the built-in debug keystore. AGP auto-generates
@@ -29,16 +74,38 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
+
     compileOptions {
+        // Java 17 language level, but the bytecode is desugared for API 19.
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+
+        // Required for legacy: brings java.time, java.util.function, etc.
+        // to API 19. Without this, any use of modern java.* APIs crashes
+        // on KitKat with NoClassDefFoundError.
+        coreLibraryDesugaringEnabled true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
     }
 }
 
 dependencies {
-    implementation fileTree(dir: 'libs', include: ['*.jar'])
-    androidTestImplementation('androidx.test.espresso:espresso-core:3.6.1')
+    // Desugaring runtime — required by coreLibraryDesugaringEnabled above.
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'
+
+    // AndroidX. Keep these versions compatible with minSdk 19.
+    // If any of them start requiring minSdk 21, pin to the last 19-compatible
+    // release and document why in README-legacy.md.
+    implementation 'androidx.annotation:annotation:1.9.1'
+
     testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.1'
 }
 
 // Optional release signing override. Only takes effect when
