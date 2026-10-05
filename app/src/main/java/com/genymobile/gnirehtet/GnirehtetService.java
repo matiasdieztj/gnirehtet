@@ -142,6 +142,11 @@ public class GnirehtetService extends VpnService {
         builder.setBlocking(true);
         builder.setMtu(config.getMtu());
 
+        // Indicar al sistema que la VPN no tiene límite de datos (para descargas en Play Store y Galaxy Store)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.setMetered(false);
+        }
+
         if (Build.VERSION.SDK_INT >= 29) {
             String proxyHostPort = config.getProxyHostPort();
             if (proxyHostPort != null) {
