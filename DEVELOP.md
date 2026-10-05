@@ -2,15 +2,9 @@
 
 ## Requirements
 
-- **Rust** 1.85+ (install via [rustup](https://rustup.rs/))
-- **Android SDK** (for APK builds) — JDK 17+ with `javac`, plus platform 35 and
-  build-tools 36. Install through your package manager or Android Studio.
-  The release script auto-detects the SDK at common locations.
-- **adb** (1.0.36+) — or let gnirehtet auto-download it
-
-## Project structure
-
+- **Rust** 1.85
 ```
+
 gnirehtet/
 ├── app/                          # Android VPN client (Java)
 │   └── src/main/java/.../
@@ -37,13 +31,14 @@ gnirehtet/
 │           ├── transport_header.rs
 │           ├── packetizer.rs     # L5→L3 packet construction
 │           ├── stream_buffer.rs  # Circular byte buffer
-│           ├── datagram_buffer.rs# Datagram buffer
+│           ├── datagram_[buffer.rs#](https://buffer.rs/#) Datagram buffer
 │           ├── selector.rs       # No-op shim (replaced mio)
 │           ├── net.rs            # Socket address helpers
 │           └── ...
 ├── Makefile                      # Build/run/test targets (Linux/macOS)
 ├── build.bat                     # Build/run/test targets (Windows)
 └── release                       # Release packaging script
+
 ```
 
 ## Build
@@ -57,43 +52,39 @@ cargo build --release
 
 ### Android APK
 
-```bash
-./gradlew :app:assembleDebug
+```
+./gradlew :app:ass
 ```
 
 ### Everything
 
-```bash
+```
 make          # Linux/macOS
 build.bat     # Windows
 ```
 
 ### Cross-compilation
 
-```bash
-make build-linux-x86_64
-make build-linux-aarch64
-make build-macos-x86_64
-make build-macos-arm64
-make build-windows-x86_64
+```
+make build-linux-x
 ```
 
 ## Run
 
-```bash
-cargo run --manifest-path relay-rust/Cargo.toml -- run
+```
+cargo run --
 ```
 
 Or after building:
 
-```bash
+```
 ./relay-rust/target/release/gnirehtet run
 ```
 
 ## Test
 
-```bash
-cargo test --manifest-path relay-rust/Cargo.toml
+```
+c
 ```
 
 ## Design
@@ -102,10 +93,6 @@ cargo test --manifest-path relay-rust/Cargo.toml
 
 ```
 Android apps → VpnService → IP packets → adb reverse tunnel → Relay server
-                                                                   ↓
-                                                            Real OS sockets
-                                                                   ↓
-                                                            Remote servers
 ```
 
 The Android device creates a VPN interface that captures all IPv4/IPv6 traffic.
@@ -124,107 +111,225 @@ the destination, and relays data bidirectionally.
 
 ### Architecture decisions
 
-| Decision | Rationale |
-|----------|-----------|
-| Single-threaded event loop | Sufficient for typical use (1-5 devices); avoids sync overhead |
-| HashMap for routing | O(1) lookup vs Vec's O(n); comment saying "HashMap less efficient" was incorrect |
-| Synthetic TCP state machine | Only implements enough TCP states to fool the device's TCP stack, not a full RFC 793 |
-| No Rc<RefCell> | Prevents runtime borrow panics; connections are Box<dyn Connection> |
-| jiff over chrono | jiff has no CVE history, lighter, actively maintained |
+| Decision ↕▾ | Rationale ↕▾ |
+|---|---|
+| −Single-threaded event loop | Sufficient for typical use (1-5 devices); avoids sync overhead |
+| −HashMap for routing | O(1) lookup vs Vec's O(n); comment saying "HashMap less efficient" was incorrect |
+| −Synthetic TCP state machine | Only implements enough TCP states to fool the device's TCP stack, not a full RFC 793 |
+| −No Rc<RefCell> | Prevents runtime borrow panics; connections are Box<dyn Connection> |
+| −jiff over chrono | jiff has no CVE history, lighter, actively maintained |
+⚙
 
 ## Release
 
 Tag a commit and push:
 
-```bash
+```
 git tag v2.6.0
 git push --tags
 ```
 
 GitHub Actions builds and attaches binaries for all 5 targets.
 
-## Known limitation: Android VpnService and the default network (Android 12+)
+## Android default-network limitation
 
-### Summary
+This section documents a platform-level constraint that affects gnirehtet
+in strict airplane mode. It is **not** a bug in the relay, the Java client,
+or any of the fixes applied in v2.6.x. It is a documented behaviour of
+AOSP's `NetworkRanker`.
 
-In strict airplane mode (WiFi OFF, cellular OFF, USB only), gnirehtet routes
-IP traffic correctly but apps that use
-`ConnectivityManager.registerDefaultNetworkCallback()` hang at startup.
-This is an **AOSP `NetworkRanker` limitation**, not a gnirehtet bug.
+### The rule
 
-### Evidence
+AOSP refuses to promote a VPN-only transport to the system default network
+slot. On the test device (Samsung Galaxy A21s, Android 12), `dumpsys
+connectivity` reports:
 
-**IP traffic works in airplane mode.** Running `ping -c 3 1.1.1.1` through
-gnirehtet (USB only, no WiFi/cellular):
+```
+Active default network: none
+```
 
-    64 bytes from 1.1.1.1: icmp_seq=1 ttl=64 time=1.79 ms
-    64 bytes from 1.1.1.1: icmp_seq=2 ttl=64 time=1.83 ms
-    64 bytes from 1.1.1.1: icmp_seq=3 ttl=64 time=1.49 ms
+And every framework `NetworkRequest` carries an explicit `&NOT_VPN`
+capability filter:
 
-`TTL=64` with `<2 ms` latency is the synthetic ICMP echo reply from
-`icmp_handler.rs` — the packet never left the host. The VPN routes traffic.
+```
+[ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VPN&NOT_VCN_MANAGED ...]
+```
 
-**But the default network is absent.** Comparing `dumpsys connectivity`:
+No network can satisfy that request when only the VPN is up. This is the
+root cause of every symptom described below.
 
-| Field                        | WiFi ON              | Airplane mode        |
-|------------------------------|----------------------|----------------------|
-| VPN Transports               | `WIFI\|VPN`          | `VPN` only           |
-| VPN UnderlyingNetworks       | `[174]`              | `[]`                 |
-| Active default network       | `174` (WiFi)         | `none`               |
-| Capabilities                 | `INTERNET&VALIDATED` | `INTERNET&VALIDATED` |
+### App taxonomy: Class A vs Class B
 
-Capabilities are identical. The difference is the transport: AOSP's
-`NetworkRanker` requires a non-VPN transport for default-network eligibility.
-A VPN-only transport is **never** promoted to default, regardless of
-capabilities.
+Apps that need connectivity fall into two behavioural classes. The
+distinction determines whether they traverse the tunnel.
 
-### Affected apps
+#### Class A — "check-and-delegate"
 
-Any app that gates its network operations on `registerDefaultNetworkCallback`
-or `getActiveNetwork()`:
+Calls `ConnectivityManager.getActiveNetwork()` (or waits for `onAvailable`
+on a `NetworkRequest`), then **opens sockets normally**. The OS routes
+those sockets through `tun0` because gnirehtet's `addRoute()` has installed
+the required routes.
 
-- **fast.com** — stuck at logo, never progresses
-- **Ookla Speedtest** — works only when WiFi/cellular is also present
-- **WiFiman** — download works; upload may timeout
+**Examples:** Play Store (`GmsDownloadService`), Galaxy Store download
+manager, Android `DownloadManager`, `WorkManager` with
+`NetworkType.CONNECTED`, most banking apps, most browser downloads, most
+chat apps.
 
-Apps that use raw sockets or `VpnService` file descriptors directly are
-unaffected.
+**Behaviour:**
 
-### Why it cannot be fixed
+| Environment ↕▾ | `getActiveNetwork()` ↕▾ | Result ↕▾ |
+|---|---|---|
+| −Strict airplane | `null` | Hangs — never opens a socket |
+| −Dummy hotspot | WiFi `Network` | ✅ Works — socket traverses the tunnel |
+| −Real WiFi | WiFi `Network` | ✅ Works |
+⚙
+
+#### Class B — "bind-to-default"
+
+Calls `ConnectivityManager.bindProcessToNetwork(getActiveNetwork())` (or
+the per-socket equivalent `Network.bindSocket()`). This hard-binds every
+socket the app opens to a specific `Network` object, **bypassing the VPN
+route table entirely**.
+
+**Examples:** Ookla Speedtest, fast.com, WiFiman, some CDN-aware SDKs
+(Akamai, Cloudflare).
+
+**Behaviour:**
+
+| Environment ↕▾ | `getActiveNetwork()` ↕▾ | Result ↕▾ |
+|---|---|---|
+| −Strict airplane | `null` | Hangs at splash |
+| −Dummy hotspot | WiFi `Network` | ❌ Fails — hotspot has no upstream |
+| −Real WiFi | WiFi `Network` | ✅ Works, but measures WiFi, not the tunnel |
+⚙
+
+### Symptom summary
+
+| Symptom ↕▾ | Class ↕▾ | Environment ↕▾ | Explanation ↕▾ |
+|---|---|---|---|
+| −Play Store download stuck at "Pendiente" | A | Airplane | `getActiveNetwork() == null` |
+| −Galaxy Store download stuck at "Pendiente" | A | Airplane | Same |
+| −Ookla hangs at splash | B | Airplane | Same, then `RetrieveServerListTask` throws |
+| −Ookla fails with dummy hotspot | B | Dummy hotspot | Sockets bound to hotspot, no upstream |
+| −Ookla works with real WiFi, 88 Mbps | B | Real WiFi | Sockets bound to WiFi, tunnel bypassed |
+| −WiFiman upload fails at ~5 s | B | Any | Same pattern |
+⚙
+
+### Why this cannot be fixed
 
 - `setUnderlyingNetworks(null)` and `setUnderlyingNetworks(new Network[0])`
-  are functionally identical on Android 12. Neither promotes a VPN-only
-  transport.
-- The only workaround would be reflection over private `ConnectivityManager`
-  APIs, which break every Android release and are hardened against exactly
-  this use case.
+are functionally identical on Android 12.
+- Forcing promotion of a VPN-only transport to default would require
+reflection over private `ConnectivityManager` APIs, which are hardened
+and unstable across Android versions.
+- Even if promotion worked, Class B apps would still
+`bindProcessToNetwork()` and sidestep the tunnel. There is no public API
+that lets a `VpnService` intercept sockets that another app has
+explicitly bound to a different `Network`.
 
 ### Workaround
 
-Connect the device to **any** WiFi network (with or without internet).
-The WiFi provides the default-network slot; gnirehtet's routes still
-intercept all app traffic via the USB tunnel.
+Run a dummy hotspot on the host:
 
-For environments without WiFi, create a hotspot on the host PC and connect
-the device to it. The hotspot does not need internet access — it only needs
-to provide the `Active default network` slot.
+```
+nmcli dev wifi hotspot ifname wlan0 ssid gnirehtet-dummy password gnirehtet123
+```
+
+Connect the device to it, ignore the "Sin acceso a Internet" toast, keep
+the tunnel active. This satisfies Class A apps (stores, downloaders) while
+leaving Class B apps (speed tests) broken.
+
+### Diagnostic recipe
+
+When a user reports "app X fails", classify it in four steps.
+
+#### 1. Relay-side check
+
+```
+RUST_LOG=debug ./
+```
+
+| Observation ↕▾ | Likely cause ↕▾ |
+|---|---|
+| −0 TCP opens during failure | Class A or B — no default network to gate on |
+| −TCP opens, none to the app's servers | Class A — UI connecting, feature still blocked |
+| −TCP opens to the app's servers, then stalls | Relay bug — investigate flow control |
+| −Many `Rejecting QUIC` | App uses QUIC heavily; may benefit from isolating fix #11 |
+⚙
+
+For Play Store specifically, look for CDN hosts:
+
+```
+grep -iE 'gvt1|dl\.google|android\.clients|play\.googleapis' /tmp/relay.log | head -20
+```
+
+If only `play.googleapis.com` and `android.clients.google.com:5228` appear
+— no `*.gvt1.com`, no `dl.google.com` — the downloader never fired. Class A.
+
+#### 2. Framework-side check
+
+```
+adb -s <serial> shell dumpsys connectivity \
+  | grep -iE "Active default network|SystemDefault|UnderlyingNetworks" | head -10
+```
+
+If `Active default network: none`, both classes will fail.
+
+#### 3. App-side check
+
+```
+adb -s <serial> logcat -c
+# (reproduce failure)
+adb -s <serial>
+```
+
+If the app's UID appears calling `bindProcessToNetwork`, it is Class B and
+will never use the tunnel.
+
+#### 4. Final classification
+
+| Behaviour ↕▾ | Class ↕▾ |
+|---|---|
+| −Works with dummy hotspot, no change in relay traffic | Class A |
+| −Fails with dummy hotspot, works with real WiFi | Class B |
+| −Neither helps | Real relay bug — open an issue |
+⚙
+
+### Throughput validation: use iperf3, not speed test apps
+
+Because Class B apps bypass the tunnel, they cannot be used to validate
+gnirehtet's throughput. The only test that traverses the tunnel is iperf3
+from Termux (Termux does not call `bindProcessToNetwork()`):
+
+```
+# Host:
+iperf3 -s -p 5201
+
+# Device:
+adb -s <serial> reverse tcp:5201 tcp:5201
+iperf3
+```
+
+**Baseline** (v2.6.3, Samsung Galaxy A21s, host on Debian 13):
+
+| Direction ↕▾ | Throughput ↕▾ | Retransmissions ↕▾ | Duration ↕▾ |
+|---|---|---|---|
+| −Upload (device → host) | ~257 Mbps | 4 | 10 s stable |
+| −Download (host → device) | ~252 Mbps | 5 | 10 s stable |
+⚙
+
+If a future change produces materially lower iperf3 numbers, that is a real
+relay regression. If only speed test apps regress, that is a Class B issue
+and is not a bug.
 
 ### References
 
-- `VpnService.setUnderlyingNetworks()`:
-  https://developer.android.com/reference/android.net/VpnService#setUnderlyingNetworks(android.net.Network[])
+- `ConnectivityManager.bindProcessToNetwork()`:
+https://developer.android.com/reference/android/net/ConnectivityManager#bindProcessToNetwork(android.net.Network)
+- `Network.bindSocket()`:
+https://developer.android.com/reference/android/net/Network#bindSocket(java.net.Socket)
 - AOSP `NetworkRanker`:
-  https://cs.android.com/android/platform/superproject/+/main:packages/modules/Connectivity/service/src/com/android/server/connectivity/NetworkRanker.java
+https://cs.android.com/android/platform/superproject/+/main:packages/modules/Connectivity/service/src/com/android/server/connectivity/NetworkRanker.java
+- NetworkManager `nmcli`:
+https://networkmanager.dev/docs/api/latest/nmcli.html
 
-### WiFiman speed test upload anomaly
-
-WiFiman's upload test may start at a moderate speed (~2-5 Mbps) and progressively 
-drop to 0 Mbps, eventually failing the test. However, pure TCP throughput tests 
-(e.g., `iperf3`) show stable, high-speed performance (~250 Mbps) in both directions 
-with minimal retransmissions.
-
-**Conclusion**: This is an application-specific behavior, not a relay bug. 
-WiFiman likely uses aggressive HTTP timeouts, specific chunked encoding, or 
-parallel connection patterns that do not interact well with the synthetic TCP 
-proxy's window management under high load. The relay correctly handles standard 
-TCP traffic and should be considered fully functional.
