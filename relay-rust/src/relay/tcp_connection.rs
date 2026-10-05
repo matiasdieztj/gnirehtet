@@ -112,6 +112,11 @@ impl Tcb {
 
     #[inline]
     fn remaining_client_window(&self) -> u16 {
+        // Si el cliente anunció ventana 0, respetarlo inmediatamente
+        if self.client_window == 0 {
+            return 0;
+        }
+    
         let wrapped_remaining = Wrapping(self.their_acknowledgement_number) + Wrapping(u32::from(self.client_window))
             - self.sequence_number;
         let remaining = wrapped_remaining.0;
@@ -602,6 +607,17 @@ impl TcpConnection {
     /// to call from within `poll_self()`.
     fn send_empty_packet_to_client(&mut self, flags: u16) {
         let window = self.advertised_window();
+    
+        // Logging adicional
+        if window == 0 {
+            cx_warn!(
+                target: TAG,
+                self.id,
+                "Advertising window=0 to client (buffer remaining={})",
+                self.client_to_network.remaining()
+            );
+        }
+    
         let ip_packet =
             Self::create_empty_response_packet(&self.id, &mut self.network_to_client, &self.tcb, flags, window);
         match Self::send_packet_to_buffer(&self.buffer, &ip_packet) {
@@ -609,8 +625,8 @@ impl TcpConnection {
                 cx_debug!(
                     target: TAG,
                     self.id,
-                    "Control packet (flags={}) sent to client",
-                    flags
+                    "Control packet (flags={}, window={}) sent to client",
+                    flags, window
                 );
             }
             Err(_) => {
@@ -886,6 +902,21 @@ impl TcpConnection {
             Some(p) if !p.is_empty() => p,
             _ => return,
         };
+
+        // Logging adicional
+        let buffer_remaining = self.client_to_network.remaining();
+        let buffer_total = self.client_to_network.capacity();
+        let buffer_used = buffer_total - buffer_remaining;
+        let advertised = self.advertised_window();
+    
+        if buffer_remaining < payload.len() {
+            cx_warn!(
+                target: TAG,
+                self.id,
+                "BUFFER FULL: remaining={}, payload={}, advertised_window={}, used={}/{}",
+                buffer_remaining, payload.len(), advertised, buffer_used, buffer_total
+            );
+        }
 
         if self.client_to_network.remaining() < payload.len() {
             cx_warn!(target: TAG, self.id, "Not enough space, dropping packet");
