@@ -31,6 +31,10 @@ jobs:
         run: cargo test --manifest-path relay-rust/Cargo.toml
 
   build-apk:
+    # Builds the modern flavor only. The legacy flavor is built in the
+    # build-legacy job below. Pinning to :app:assembleModernDebug is
+    # required because flavorDimensions makes the generic
+    # :app:assembleDebug target expand to both flavors.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,21 +48,32 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build APK
-        run: ./gradlew :app:assembleDebug
+      - name: Build APK (modern)
+        run: ./gradlew :app:assembleModernDebug
 
   build-legacy:
+    # Builds the legacy flavor (minSdk 19, Android 4.4). Non-blocking:
+    # failures here do not fail the workflow. The job is kept separate
+    # because the legacy flavor requires NDK and CMake packages that the
+    # modern job does not need.
     runs-on: ubuntu-latest
-    continue-on-error: true    # legacy es experimental, no bloquea PRs
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
           java-version: '17'
+          distribution: 'temurin'
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: 'platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1'
-      - name: Build legacy debug
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build APK (legacy)
         run: ./gradlew :app:assembleLegacyDebug
