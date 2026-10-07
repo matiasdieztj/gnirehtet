@@ -20,6 +20,7 @@ mod cli;
 mod commands;
 mod execution_error;
 mod logger;
+mod transport;
 
 fn main() {
     let log_file = cli::get_log_file();

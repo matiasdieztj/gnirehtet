@@ -175,16 +175,66 @@ pub fn cmd_stop(serial: Option<&str>) -> Result<(), CommandExecutionError> {
     )
 }
 
-pub fn cmd_tunnel(serial: Option<&str>, port: u16) -> Result<(), CommandExecutionError> {
-    exec_adb(
-        serial,
-        vec!["reverse", "localabstract:gnirehtet", format!("tcp:{}", port).as_str()],
-    )
+pub fn cmd_tunnel(
+    serial: Option<&str>,
+    port: u16,
+    transport: crate::transport::TransportMode,
+) -> Result<(), CommandExecutionError> {
+    use crate::transport::TransportMode;
+        
+    match transport {
+        TransportMode::Reverse => exec_adb(
+            serial,
+            vec![
+                "reverse".to_string(),
+                "localabstract:gnirehtet".to_string(),
+                format!("tcp:{}", port),
+            ],
+        ),
+        TransportMode::Forward => {
+            let spec = format!("tcp:{}", port);
+            // Remove any stale forward on this port before creating a new
+            // one. A leftover forward from a previous run accepts the
+            // relay's TCP handshake via adb, then immediately closes it
+            // (the device is not listening anymore), producing a spurious
+            // EOF that kills the relay before the client has had a chance
+            // to start. Errors are ignored: --remove fails when there is
+            // nothing to remove, which is the common case.
+            
+            // Suppress adb's stderr for this best-effort cleanup: it prints
+            // "listener 'tcp:N' not found" when there is nothing to remove,
+            // which is the common case and would just be log noise.
+            let adb = crate::adb::get_adb_path();
+            let mut cmd = std::process::Command::new(&adb);
+            if let Some(s) = serial {
+                cmd.args(["-s", s]);
+            }
+            let _ = cmd
+                .args(["forward", "--remove", &spec])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            exec_adb(serial, vec!["forward".to_string(), spec.clone(), spec])
+        }
+    }
 }
 
-pub fn cmd_relay(port: u16) -> Result<(), CommandExecutionError> {
-    info!(target: TAG, "Starting relay server on port {}...", port);
-    relaylib::relay(port)?;
+pub fn cmd_relay(
+    port: u16,
+    transport: crate::transport::TransportMode,
+    serial: Option<String>,
+) -> Result<(), CommandExecutionError> {
+    use crate::transport::TransportMode;
+    match transport {
+        TransportMode::Reverse => {
+            info!(target: TAG, "Starting relay server in reverse mode on port {}...", port);
+            relaylib::relay(port)?;
+        }
+        TransportMode::Forward => {
+            info!(target: TAG, "Starting relay in forward mode on port {}...", port);
+            relaylib::relay::Relay::new(port).run_forward(serial)?;
+        }
+    }
     Ok(())
 }
 
@@ -237,6 +287,7 @@ pub fn cmd_start(
     allow_apps: &[String],
     deny_apps: &[String],
     socks5: Option<&str>,
+    transport: crate::transport::TransportMode,
 ) -> Result<(), CommandExecutionError> {
     ensure_adb();
     if must_install_client(serial)? {
@@ -246,6 +297,25 @@ pub fn cmd_start(
 
     info!(target: TAG, "Starting client...");
 
+    // `am start` on API 19 does not support `--esa` (String array extras);
+    // it was added in API 21. On KitKat we have to skip array extras and
+    // let the client fall back to its defaults (DNS 8.8.8.8, route 0.0.0.0/0,
+    // no per-app allow/deny). Single-value extras (--es, --ei) work everywhere
+    // and are always passed.
+    let sdk = crate::transport::query_device_sdk(serial).unwrap_or(0);
+    let supports_array_extras = sdk >= 21;
+    if !supports_array_extras && (dns_servers.is_some() || routes.is_some()
+        || proxy_exclusions.is_some() || !allow_apps.is_empty() || !deny_apps.is_empty())
+    {
+        warn!(
+            target: TAG,
+            "Device SDK {} < 21: --esa not supported, ignoring array extras \
+             (DNS, routes, proxy exclusions, allow/deny apps). \
+             The client will use its built-in defaults.",
+            sdk
+        );
+    }
+
     // Best-effort correlation: remember which serial is about to open a
     // connection to the relay. See relay::serial_registry for details.
     if let Some(s) = effective_serial(serial) {
@@ -253,7 +323,7 @@ pub fn cmd_start(
         debug!(target: TAG, "Registered serial {} for the next relay connection", s);
     }
 
-    cmd_tunnel(serial, port)?;
+    cmd_tunnel(serial, port, transport)?;
 
     let mut adb_args: Vec<String> = vec![
         "shell".into(),
@@ -264,12 +334,12 @@ pub fn cmd_start(
         "-n".into(),
         "com.genymobile.gnirehtet/.GnirehtetActivity".into(),
     ];
-    if let Some(dns_servers) = dns_servers {
+    if supports_array_extras && let Some(dns_servers) = dns_servers {
         adb_args.push("--esa".into());
         adb_args.push("dnsServers".into());
         adb_args.push(dns_servers.into());
     }
-    if let Some(routes) = routes {
+    if supports_array_extras && let Some(routes) = routes {
         adb_args.push("--esa".into());
         adb_args.push("routes".into());
         adb_args.push(routes.into());
@@ -279,7 +349,7 @@ pub fn cmd_start(
         adb_args.push("proxyHostPort".into());
         adb_args.push(proxy.into());
     }
-    if let Some(exclusions) = proxy_exclusions {
+    if supports_array_extras && let Some(exclusions) = proxy_exclusions {
         adb_args.push("--esa".into());
         adb_args.push("proxyExclusionList".into());
         adb_args.push(exclusions.into());
@@ -292,12 +362,12 @@ pub fn cmd_start(
     adb_args.push("--ei".into());
     adb_args.push("mtu".into());
     adb_args.push(mtu.to_string());
-    if !allow_apps.is_empty() {
+    if supports_array_extras && !allow_apps.is_empty() {
         adb_args.push("--esa".into());
         adb_args.push("allowApps".into());
         adb_args.push(allow_apps.join(","));
     }
-    if !deny_apps.is_empty() {
+    if supports_array_extras && !deny_apps.is_empty() {
         adb_args.push("--esa".into());
         adb_args.push("denyApps".into());
         adb_args.push(deny_apps.join(","));
@@ -331,6 +401,7 @@ pub fn cmd_autostart(
             &[],
             &[],
             socks5,
+            crate::transport::TransportMode::Reverse,
         )
     }));
     adb_monitor.set_usb_only(!allow_wifi);
@@ -350,6 +421,7 @@ fn async_start(
     allow_apps: &[String],
     deny_apps: &[String],
     socks5: Option<&str>,
+    transport: crate::transport::TransportMode,
 ) {
     let start_serial = serial.map(String::from);
     let start_dns_servers = dns_servers.map(String::from);
@@ -377,6 +449,7 @@ fn async_start(
             &allow_apps_owned,
             &deny_apps_owned,
             socks5,
+            transport,
         ) {
             crate::execution_error::print_error(&err);
         }
@@ -396,34 +469,34 @@ pub fn cmd_run(
     allow_apps: &[String],
     deny_apps: &[String],
     socks5: Option<&str>,
+    transport_pref: crate::transport::TransportPreference,
 ) -> Result<(), CommandExecutionError> {
     if let Some(proxy) = socks5
         && let Ok(addr) = proxy.parse::<std::net::SocketAddr>()
     {
         let _ = tcp_connection::SOCKS5_PROXY.set(addr);
     }
+
+    let transport = transport_pref.resolve(serial);
+    info!(target: TAG, "Using transport mode: {:?}", transport);
+
     async_start(
-        serial,
-        dns_servers,
-        routes,
-        port,
-        proxy,
-        proxy_exclusions,
-        mtu,
-        allow_apps,
-        deny_apps,
-        socks5,
+        serial, dns_servers, routes, port, proxy, proxy_exclusions,
+        mtu, allow_apps, deny_apps, socks5,
+        transport,
     );
 
     let ctrlc_serial = serial.map(String::from);
+    let relay_serial = serial.map(String::from);
     let rt = tokio::runtime::Runtime::new().map_err(|e| CommandExecutionError::Io(std::io::Error::other(e)))?;
 
     rt.block_on(async {
         tokio::select! {
-            result = tokio::task::spawn_blocking(move || cmd_relay(port)) => {
-                result.map_err(|e| {
-                    CommandExecutionError::Io(std::io::Error::other(e))
-                })?
+            result = tokio::task::spawn_blocking(move ||
+                    cmd_relay(port, transport, relay_serial)) => {
+                        result.map_err(|e| {
+                        CommandExecutionError::Io(std::io::Error::other(e))
+            })?
             }
             _ = tokio::signal::ctrl_c() => {
                 info!(target: TAG, "Interrupted");
@@ -436,6 +509,7 @@ pub fn cmd_run(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_autorun(
     dns_servers: Option<&str>,
     routes: Option<&str>,
@@ -444,7 +518,17 @@ pub fn cmd_autorun(
     mtu: u16,
     allow_wifi: bool,
     socks5: Option<&str>,
+    transport_pref: crate::transport::TransportPreference,
 ) -> Result<(), CommandExecutionError> {
+    use crate::transport::TransportMode;
+    let transport = transport_pref.resolve(None);
+    if transport == TransportMode::Forward {
+        return Err(CommandExecutionError::Io(std::io::Error::other(
+            "forward transport is not supported by 'autorun' (multi-device); \
+             use 'run --transport=forward --serial <SERIAL>' instead",
+        )));
+    }
+    
     if let Some(proxy) = socks5
         && let Ok(addr) = proxy.parse::<std::net::SocketAddr>()
     {
@@ -464,7 +548,7 @@ pub fn cmd_autorun(
         });
     }
 
-    cmd_relay(port)
+    cmd_relay(port, transport, None)
 }
 
 pub fn cmd_restart(
@@ -472,8 +556,22 @@ pub fn cmd_restart(
     dns_servers: Option<&str>,
     routes: Option<&str>,
     port: u16,
+    transport_pref: crate::transport::TransportPreference,
 ) -> Result<(), CommandExecutionError> {
+    let transport = transport_pref.resolve(serial);
     cmd_stop(serial)?;
-    cmd_start(serial, dns_servers, routes, port, None, None, 0x4000, &[], &[], None)?;
+    cmd_start(
+        serial,
+        dns_servers,
+        routes,
+        port,
+        None,
+        None,
+        0x4000,
+        &[],
+        &[],
+        None,
+        transport,
+    )?;
     Ok(())
 }

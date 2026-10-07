@@ -19,6 +19,8 @@
 
 use log::*;
 use std::io;
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use super::client::Client;
 use super::serial_registry;
@@ -58,6 +60,59 @@ impl Relay {
             std::thread::spawn(move || {
                 Client::run_blocking(std_stream, serial);
             });
+        }
+    }
+
+    /// Forward mode: connect to the client's `ServerSocket` instead of
+    /// listening. Used for API 19 devices where `adb reverse` is unavailable.
+    ///
+    /// The connection is retried on every disconnect. There are two reasons:
+    ///
+    /// 1. Startup race: `adb forward` accepts the host-side TCP handshake
+    ///    immediately, even before the device has bound its `ServerSocket`.
+    ///    A successful `TcpStream::connect` therefore does NOT mean the
+    ///    client is listening. If the client is not ready yet, adb closes
+    ///    the connection and `Client::run_blocking` sees EOF right away.
+    ///    Without a retry, the whole process would exit before the client
+    ///    had a chance to start.
+    ///
+    /// 2. Client reconnects: the Java `PersistentRelayTunnel` recreates its
+    ///    `ServerSocket` when the tunnel drops. The relay must reconnect too.
+    pub fn run_forward(&self, serial: Option<String>) -> io::Result<()> {
+        loop {
+            let stream = self.connect_forward()?;
+            Client::run_blocking(stream, serial.clone());
+            info!(target: TAG, "Client disconnected, retrying in 500 ms...");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn connect_forward(&self) -> io::Result<TcpStream> {
+        let addr = format!("127.0.0.1:{}", self.port);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match TcpStream::connect(&addr) {
+                Ok(stream) => {
+                    info!(target: TAG, "Forward tunnel connected on {}", addr);
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        error!(
+                            target: TAG,
+                            "Timed out waiting for client to listen on {}: {}",
+                            addr, err
+                        );
+                        return Err(err);
+                    }
+                    debug!(
+                        target: TAG,
+                        "Waiting for client to accept on {} ({}); retrying...",
+                        addr, err
+                    );
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
         }
     }
 }

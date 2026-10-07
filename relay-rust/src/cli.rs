@@ -20,6 +20,7 @@ use log::*;
 use crate::commands;
 use crate::execution_error;
 use crate::execution_error::CommandExecutionError;
+use crate::transport::TransportPreference;
 
 const TAG: &str = "Main";
 
@@ -85,6 +86,8 @@ enum Commands {
         /// SOCKS5 proxy (host:port)
         #[arg(long)]
         socks5: Option<String>,
+        #[arg(long, default_value = "auto")]
+        transport: TransportPreference,
     },
     /// Enable reverse tethering for all devices (monitor + auto-start + relay)
     Autorun {
@@ -111,7 +114,7 @@ enum Commands {
         socks5: Option<String>,
     },
     /// Start a client on the Android device and exit
-    Start {
+        Start {
         /// Device serial
         serial: Option<String>,
         /// DNS server(s) (comma-separated)
@@ -141,6 +144,9 @@ enum Commands {
         /// SOCKS5 proxy (host:port)
         #[arg(long)]
         socks5: Option<String>,
+        /// Transport mode (auto, reverse or forward)
+        #[arg(long, default_value = "auto")]
+        transport: TransportPreference,
     },
     /// Listen for device connections and start a client on every detected device
     Autostart {
@@ -181,6 +187,9 @@ enum Commands {
         /// Relay server port
         #[arg(short = 'p', default_value_t = 31416)]
         port: u16,
+        /// Transport mode (auto, reverse or forward)
+        #[arg(long, default_value = "auto")]
+        transport: TransportPreference,
     },
     /// Set up the 'adb reverse' tunnel
     Tunnel {
@@ -189,12 +198,18 @@ enum Commands {
         /// Relay server port
         #[arg(short = 'p', default_value_t = 31416)]
         port: u16,
+        /// Transport mode (auto, reverse or forward)
+        #[arg(long, default_value = "auto")]
+        transport: TransportPreference,
     },
     /// Start the relay server in the current terminal
     Relay {
         /// Relay server port
         #[arg(short = 'p', default_value_t = 31416)]
         port: u16,
+        /// Transport mode (auto, reverse or forward)
+        #[arg(long, default_value = "auto")]
+        transport: TransportPreference,
     },
 }
 
@@ -216,6 +231,7 @@ impl Commands {
                 allow_app,
                 deny_app,
                 socks5,
+                transport,
             } => commands::cmd_run(
                 serial.as_deref(),
                 dns.as_deref(),
@@ -228,6 +244,7 @@ impl Commands {
                 allow_app,
                 deny_app,
                 socks5.as_deref(),
+                *transport,
             ),
             Commands::Autorun {
                 dns,
@@ -245,6 +262,7 @@ impl Commands {
                 *mtu,
                 *allow_wifi,
                 socks5.as_deref(),
+                TransportPreference::Auto,
             ),
             Commands::Start {
                 serial,
@@ -257,6 +275,7 @@ impl Commands {
                 allow_app,
                 deny_app,
                 socks5,
+                transport,
             } => commands::cmd_start(
                 serial.as_deref(),
                 dns.as_deref(),
@@ -268,6 +287,7 @@ impl Commands {
                 allow_app,
                 deny_app,
                 socks5.as_deref(),
+                transport.resolve(serial.as_deref()),
             ),
             Commands::Autostart {
                 dns,
@@ -290,9 +310,24 @@ impl Commands {
                 dns,
                 routes,
                 port,
-            } => commands::cmd_restart(serial.as_deref(), dns.as_deref(), routes.as_deref(), *port),
-            Commands::Tunnel { serial, port } => commands::cmd_tunnel(serial.as_deref(), *port),
-            Commands::Relay { port } => commands::cmd_relay(*port),
+                transport,
+            } => commands::cmd_restart(
+                serial.as_deref(),
+                dns.as_deref(),
+                routes.as_deref(),
+                *port,
+                *transport,
+            ),
+            Commands::Tunnel { serial, port, transport } => commands::cmd_tunnel(
+                serial.as_deref(),
+                *port,
+                transport.resolve(serial.as_deref()),
+            ),
+            Commands::Relay { port, transport } => commands::cmd_relay(
+                *port,
+                transport.resolve(None),
+                None,
+            ),
         }
     }
 }
@@ -358,7 +393,16 @@ fn interactive_prompt() {
                 let dns = commands::detect_system_dns().join(",");
                 let mtu = commands::detect_mtu();
                 eprintln!("Starting autorun with: DNS={}  MTU={}", dns, mtu);
-                let result = commands::cmd_autorun(Some(&dns), None, 31416, false, mtu, false, None);
+                let result = commands::cmd_autorun(
+                    Some(&dns),
+                    None,
+                    31416,
+                    false,
+                    mtu,
+                    false,
+                    None,
+                    TransportPreference::Auto,
+                );
                 if let Err(ref err) = result {
                     execution_error::print_error(err);
                 }
