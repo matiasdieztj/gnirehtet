@@ -8,3 +8,6 @@ relay-rust/target/
 *.zip
 dist/
 .reasonix/
+
+# Repomix digest output (not part of the repo)
+repomix-output.xml
