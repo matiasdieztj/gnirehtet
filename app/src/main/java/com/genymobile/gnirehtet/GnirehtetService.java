@@ -85,14 +85,20 @@ public class GnirehtetService extends VpnService {
         Log.d(TAG, "Received request " + action);
         if (ACTION_START_VPN.equals(action)) {
             if (isRunning()) {
-                Log.d(TAG, "VPN already running, ignore START request");
-            } else {
-                VpnConfiguration config = intent.getParcelableExtra(EXTRA_VPN_CONFIGURATION);
-                if (config == null) {
-                    config = new VpnConfiguration();
-                }
-                startVpn(config);
+                // If the framework dropped our VPN (e.g. the fd was closed
+                // after an idle period on KitKat, or a previous tunnel
+                // failure left things in a bad state), the stale vpnInterface
+                // makes isRunning() lie. Re-establish unconditionally: it is
+                // safe because close() nulls the field and setupVpn() will
+                // create a fresh ParcelFileDescriptor.
+                Log.d(TAG, "VPN already running, restarting to ensure fresh state");
+                close();
             }
+            VpnConfiguration config = intent.getParcelableExtra(EXTRA_VPN_CONFIGURATION);
+            if (config == null) {
+                config = new VpnConfiguration();
+            }
+            startVpn(config);
         } else if (ACTION_CLOSE_VPN.equals(action)) {
             close();
         }
