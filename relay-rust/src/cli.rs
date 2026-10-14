@@ -86,8 +86,39 @@ enum Commands {
         /// SOCKS5 proxy (host:port)
         #[arg(long)]
         socks5: Option<String>,
+        /// Transport mode (auto, reverse or forward)
         #[arg(long, default_value = "auto")]
         transport: TransportPreference,
+        /// Create a dummy Wi-Fi hotspot on the host so the device has an
+        /// active network. Required on API 19-20 (KitKat) and API 31+, where
+        /// the framework does not promote a VPN-only transport to the system
+        /// default. Linux uses nmcli; Windows uses netsh/WinRT.
+        ///
+        /// On Linux, if multiple Wi-Fi interfaces exist, the relay picks a
+        /// disconnected one so the host's own connection is preserved. If
+        /// every interface is connected, it offers existing open APs before
+        /// falling back to a destructive takeover (see --dummy-wifi-force).
+        #[arg(long)]
+        dummy_wifi: bool,
+        /// SSID for the dummy Wi-Fi hotspot. When omitted, a unique SSID of
+        /// the form 'gnirehtet-<5 hex>' is derived from the hostname, with
+        /// collision detection against nearby gnirehtet-* networks. The
+        /// actual SSID is propagated to the Android client via an intent
+        /// extra so it can pick the right AP when several hosts broadcast.
+        #[arg(long)]
+        dummy_wifi_ssid: Option<String>,
+        /// Wi-Fi interface for the dummy hotspot (Linux only). Auto-detected
+        /// via nmcli when omitted. Passing this skips interface enumeration
+        /// and the associated prompts entirely.
+        #[arg(long)]
+        dummy_wifi_interface: Option<String>,
+        /// Skip the interactive confirmation when the dummy Wi-Fi setup would
+        /// disrupt the host's current Wi-Fi connection (all interfaces are
+        /// already connected). Implied when stdin is not a TTY: in that case
+        /// the relay runs without a dummy Wi-Fi rather than making a
+        /// destructive decision unattended.
+        #[arg(long)]
+        dummy_wifi_force: bool,
     },
     /// Enable reverse tethering for all devices (monitor + auto-start + relay)
     Autorun {
@@ -112,9 +143,20 @@ enum Commands {
         /// SOCKS5 proxy (host:port)
         #[arg(long)]
         socks5: Option<String>,
+        /// Create a dummy Wi-Fi hotspot on the host
+        #[arg(long)]
+        dummy_wifi: bool,
+        /// SSID for the dummy Wi-Fi hotspot. When omitted, auto-generated
+        /// from the hostname with collision detection.
+        #[arg(long)]
+        dummy_wifi_ssid: Option<String>,
+        /// Skip the interactive confirmation when the dummy Wi-Fi setup would
+        /// disrupt the host's current Wi-Fi connection.
+        #[arg(long)]
+        dummy_wifi_force: bool,
     },
     /// Start a client on the Android device and exit
-        Start {
+    Start {
         /// Device serial
         serial: Option<String>,
         /// DNS server(s) (comma-separated)
@@ -147,6 +189,12 @@ enum Commands {
         /// Transport mode (auto, reverse or forward)
         #[arg(long, default_value = "auto")]
         transport: TransportPreference,
+        /// SSID of the dummy Wi-Fi AP the client should prefer when multiple
+        /// gnirehtet-* networks are in range. Normally set internally by
+        /// `cmd_run` from the hotspot's actual SSID; only useful when the
+        /// hotspot was created externally.
+        #[arg(long)]
+        dummy_wifi_ssid: Option<String>,
     },
     /// Listen for device connections and start a client on every detected device
     Autostart {
@@ -210,6 +258,21 @@ enum Commands {
         /// Transport mode (auto, reverse or forward)
         #[arg(long, default_value = "auto")]
         transport: TransportPreference,
+        /// Create a dummy Wi-Fi hotspot on the host
+        #[arg(long)]
+        dummy_wifi: bool,
+        /// SSID for the dummy Wi-Fi hotspot. When omitted, auto-generated
+        /// from the hostname with collision detection.
+        #[arg(long)]
+        dummy_wifi_ssid: Option<String>,
+        /// Wi-Fi interface for the dummy hotspot (Linux only). Auto-detected
+        /// via nmcli when omitted.
+        #[arg(long)]
+        dummy_wifi_interface: Option<String>,
+        /// Skip the interactive confirmation when the dummy Wi-Fi setup would
+        /// disrupt the host's current Wi-Fi connection.
+        #[arg(long)]
+        dummy_wifi_force: bool,
     },
 }
 
@@ -232,6 +295,10 @@ impl Commands {
                 deny_app,
                 socks5,
                 transport,
+                dummy_wifi,
+                dummy_wifi_ssid,
+                dummy_wifi_interface,
+                dummy_wifi_force,
             } => commands::cmd_run(
                 serial.as_deref(),
                 dns.as_deref(),
@@ -245,6 +312,10 @@ impl Commands {
                 deny_app,
                 socks5.as_deref(),
                 *transport,
+                *dummy_wifi,
+                dummy_wifi_ssid.as_deref(),
+                dummy_wifi_interface.as_deref(),
+                *dummy_wifi_force,
             ),
             Commands::Autorun {
                 dns,
@@ -254,6 +325,9 @@ impl Commands {
                 mtu,
                 allow_wifi,
                 socks5,
+                dummy_wifi,
+                dummy_wifi_ssid,
+                dummy_wifi_force,
             } => commands::cmd_autorun(
                 dns.as_deref(),
                 routes.as_deref(),
@@ -263,6 +337,9 @@ impl Commands {
                 *allow_wifi,
                 socks5.as_deref(),
                 TransportPreference::Auto,
+                *dummy_wifi,
+                dummy_wifi_ssid.as_deref(),
+                *dummy_wifi_force,
             ),
             Commands::Start {
                 serial,
@@ -276,6 +353,7 @@ impl Commands {
                 deny_app,
                 socks5,
                 transport,
+                dummy_wifi_ssid,
             } => commands::cmd_start(
                 serial.as_deref(),
                 dns.as_deref(),
@@ -288,6 +366,7 @@ impl Commands {
                 deny_app,
                 socks5.as_deref(),
                 transport.resolve(serial.as_deref()),
+                dummy_wifi_ssid.as_deref(),
             ),
             Commands::Autostart {
                 dns,
@@ -303,6 +382,7 @@ impl Commands {
                 *mtu,
                 *allow_wifi,
                 socks5.as_deref(),
+                None, // dummy_wifi_ssid — not applicable to autostart
             ),
             Commands::Stop { serial } => commands::cmd_stop(serial.as_deref()),
             Commands::Restart {
@@ -323,10 +403,21 @@ impl Commands {
                 *port,
                 transport.resolve(serial.as_deref()),
             ),
-            Commands::Relay { port, transport } => commands::cmd_relay(
+            Commands::Relay {
+                port,
+                transport,
+                dummy_wifi,
+                dummy_wifi_ssid,
+                dummy_wifi_interface,
+                dummy_wifi_force,
+            } => commands::cmd_relay(
                 *port,
                 transport.resolve(None),
                 None,
+                *dummy_wifi,
+                dummy_wifi_ssid.as_deref(),
+                dummy_wifi_interface.as_deref(),
+                *dummy_wifi_force,
             ),
         }
     }
@@ -389,7 +480,9 @@ fn interactive_prompt() {
                 continue;
             }
             "" | "3" => {
-                // Auto-detect DNS and MTU, then run autorun
+                // Auto-detect DNS and MTU, then run autorun. `dummy_wifi` is
+                // off by default in the interactive prompt — the user can
+                // pass --dummy-wifi explicitly on the command line.
                 let dns = commands::detect_system_dns().join(",");
                 let mtu = commands::detect_mtu();
                 eprintln!("Starting autorun with: DNS={}  MTU={}", dns, mtu);
@@ -402,6 +495,9 @@ fn interactive_prompt() {
                     false,
                     None,
                     TransportPreference::Auto,
+                    false,
+                    None,
+                    false,
                 );
                 if let Err(ref err) = result {
                     execution_error::print_error(err);
