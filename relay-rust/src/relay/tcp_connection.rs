@@ -112,7 +112,7 @@ impl Tcb {
 
     #[inline]
     fn remaining_client_window(&self) -> u16 {
-        // Si el cliente anunció ventana 0, respetarlo inmediatamente
+        // If the client advertised a zero window, honor it immediately.
         if self.client_window == 0 {
             return 0;
         }
@@ -698,11 +698,11 @@ impl TcpConnection {
 
         let expected_packet = self.tcb.acknowledgement_number.0;
         if tcp_header.sequence_number() != expected_packet {
-            // ¿Es una retransmisión? (seq < expected en aritmética de wraparound)
+            // Is this a retransmission? (seq < expected under wraparound arithmetic)
             let diff = tcp_header.sequence_number().wrapping_sub(expected_packet) as i32;
             if diff < 0 {
-                // El emisor está repitiendo un segmento que ya ACKeamos.
-                // Reenviar el ACK actual para que pueda avanzar.
+                // The sender is repeating a segment we already acknowledged.
+                // Resend the current ACK so it can make progress.
                 cx_debug!(
                     target: TAG,
                     self.id,
@@ -920,16 +920,16 @@ impl TcpConnection {
 
         if self.client_to_network.remaining() < payload.len() {
             cx_warn!(target: TAG, self.id, "Not enough space, dropping packet");
-            // Enviar ACK con la ventana actual. Si el buffer está lleno, la
-            // ventana será 0 y el dispositivo dejará de mandar. Sin esto, el
-            // dispositivo retransmite para siempre y cada retransmisión se
-            // ignora (seq mismatch), quemando CPU.
+            // Send an ACK with the current window. If the buffer is full, the
+            // window will be 0 and the device will stop sending. Without this,
+            // the device retransmits forever and every retransmission is
+            // ignored (seq mismatch), burning CPU.
             self.send_empty_packet_to_client(tcp_header::FLAG_ACK);
             return;
         }
 
         self.client_to_network.read_from(payload);
-        // ACK inmediato al dispositivo por los bytes recién recibidos
+        // Immediate ACK to the device for the bytes just received.
         self.tcb.acknowledgement_number += Wrapping(payload.len() as u32);
         self.send_empty_packet_to_client(tcp_header::FLAG_ACK);
     }

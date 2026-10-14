@@ -36,8 +36,9 @@ impl Relay {
         Self { port }
     }
 
-    /// Start the relay server. Creates a tokio runtime and enters the async accept loop.
-    /// Accepted clients are handed off to dedicated OS threads.
+    /// Start the relay server in reverse mode. Creates a tokio runtime and
+    /// enters the async accept loop. Accepted clients are handed off to
+    /// dedicated OS threads.
     pub fn run(&self) -> io::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(self.run_async())
@@ -66,24 +67,54 @@ impl Relay {
     /// Forward mode: connect to the client's `ServerSocket` instead of
     /// listening. Used for API 19 devices where `adb reverse` is unavailable.
     ///
-    /// The connection is retried on every disconnect. There are two reasons:
+    /// # Retry strategy
     ///
-    /// 1. Startup race: `adb forward` accepts the host-side TCP handshake
-    ///    immediately, even before the device has bound its `ServerSocket`.
-    ///    A successful `TcpStream::connect` therefore does NOT mean the
-    ///    client is listening. If the client is not ready yet, adb closes
-    ///    the connection and `Client::run_blocking` sees EOF right away.
-    ///    Without a retry, the whole process would exit before the client
-    ///    had a chance to start.
+    /// `adb forward` accepts the host-side TCP handshake *immediately*, even
+    /// before the device has bound its `ServerSocket`. A successful
+    /// `TcpStream::connect` therefore does NOT mean the client is listening.
+    /// When the device is not ready, adb closes the connection right away and
+    /// the relay sees EOF as soon as it reads — a "probe" connection.
     ///
-    /// 2. Client reconnects: the Java `PersistentRelayTunnel` recreates its
-    ///    `ServerSocket` when the tunnel drops. The relay must reconnect too.
+    /// Without backing off, the relay would produce a storm of ~10–16 probe
+    /// connections during the 5–8 seconds that KitKat typically takes to
+    /// bring up the `ServerSocket`. To avoid that, consecutive short
+    /// connections (which indicate the client is not yet ready) trigger
+    /// exponential backoff: 500 ms → 1 s → 2 s → 4 s (capped). A normal
+    /// disconnect (connection lived long enough to be real) resets the
+    /// counter and retries at the default 500 ms cadence.
     pub fn run_forward(&self, serial: Option<String>) -> io::Result<()> {
+        let mut consecutive_probes: u32 = 0;
+
         loop {
+            let start = Instant::now();
             let stream = self.connect_forward()?;
             Client::run_blocking(stream, serial.clone());
-            info!(target: TAG, "Client disconnected, retrying in 500 ms...");
-            std::thread::sleep(Duration::from_millis(500));
+            let duration = start.elapsed();
+
+            if duration < Duration::from_millis(500) {
+                // Probe connection: the device's ServerSocket wasn't listening
+                // yet. Back off exponentially so a slow client start does not
+                // flood the log or waste CPU.
+                consecutive_probes = consecutive_probes.saturating_add(1);
+                let shift = consecutive_probes.min(3);
+                let delay_ms = 500u64 << shift;
+                debug!(
+                    target: TAG,
+                    "Client not ready (probe #{}, connection ended after {:?}); retrying in {} ms",
+                    consecutive_probes, duration, delay_ms
+                );
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            } else {
+                // Real client: it connected, did work, then dropped. Reset
+                // the backoff and retry at the normal cadence.
+                consecutive_probes = 0;
+                info!(
+                    target: TAG,
+                    "Client disconnected after {:?}, retrying in 500 ms...",
+                    duration
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
         }
     }
 
@@ -93,7 +124,10 @@ impl Relay {
         loop {
             match TcpStream::connect(&addr) {
                 Ok(stream) => {
-                    info!(target: TAG, "Forward tunnel connected on {}", addr);
+                    // Not logged here: the connect succeeding does not mean
+                    // the client is listening (see run_forward's doc comment).
+                    // The real "connected" log happens inside Client after
+                    // the first successful read.
                     return Ok(stream);
                 }
                 Err(err) => {

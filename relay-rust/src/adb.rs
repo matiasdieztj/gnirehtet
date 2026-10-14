@@ -22,7 +22,7 @@ use crate::execution_error::{Cmd, CommandExecutionError, ProcessIoError, Process
 
 const TAG: &str = "Adb";
 
-pub const REQUIRED_APK_VERSION_CODE: &str = "11";
+pub const REQUIRED_APK_VERSION_CODE: &str = "2603";
 
 static ADB_PATH: OnceLock<String> = OnceLock::new();
 
@@ -284,7 +284,8 @@ pub fn must_install_client(serial: Option<&str>) -> Result<bool, CommandExecutio
                             }
                     }
                 }
-                // Si no se encontró el paquete o no tiene versionCode, requiere instalación
+                // If the package was not found, or has no versionCode, it
+                // requires installation.
                 Ok(true)
             } else {
                 let cmd = Cmd::new(adb, args);
