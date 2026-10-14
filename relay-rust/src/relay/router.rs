@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use super::binary;
 use super::client::{Client, ClientChannel, SharedBuffer};
@@ -16,16 +17,24 @@ use super::tcp_connection::TcpConnection;
 use super::udp_connection::UdpConnection;
 
 const TAG: &str = "Router";
+/// How long a closed 4-tuple stays in the recently-closed map. During this
+/// window, any packet for that tuple is dropped silently instead of
+/// creating a new connection. This absorbs the residual RST that the
+/// client sends milliseconds after FIN/ACK — without it, the RST becomes
+/// the "first packet" of a fresh connection and is rejected with
+/// "Unexpected first packet; flags=4", producing a storm of reconnect
+/// loops that hang for up to 40 seconds.
+const RECENTLY_CLOSED_TTL: Duration = Duration::from_secs(2);
 
 pub struct Router {
     client: Weak<RefCell<Client>>,
-    /// Shared outgoing buffer. Passed to every connection so that they can
-    /// write back to the device without borrowing the `Client`.
     buffer: Option<SharedBuffer>,
-    /// Label included in every connection id so that log lines can be
-    /// correlated with a specific device.
     client_label: Rc<str>,
     connections: HashMap<ConnectionId, Rc<RefCell<dyn Connection>>>,
+    /// 4-tuples that closed in the last `RECENTLY_CLOSED_TTL`. Any packet
+    /// arriving for one of these is dropped instead of spawning a new
+    /// connection, which is what kills the RST storm.
+    recently_closed: HashMap<ConnectionId, Instant>,
 }
 
 impl Router {
@@ -35,6 +44,7 @@ impl Router {
             buffer: None,
             client_label: Rc::from(""),
             connections: HashMap::new(),
+            recently_closed: HashMap::new(),
         }
     }
 
@@ -102,14 +112,34 @@ impl Router {
                 };
                 ConnectionId::from_headers(&ip_header_data, transport_header_data, self.client_label.clone())
             };
+
+            // Purge expired entries first, so the TTL check below sees a
+            // clean state.
+            let now = Instant::now();
+            self.recently_closed
+                .retain(|_, closed_at| now.duration_since(*closed_at) < RECENTLY_CLOSED_TTL);
+
+            // If this 4-tuple closed recently, absorb the packet. The
+            // client reopens the tuple with a residual RST milliseconds
+            // after FIN/ACK; without this, the RST is treated as the
+            // first packet of a new connection and rejected, producing
+            // a storm of reconnect loops.
+            if self.recently_closed.contains_key(&id) {
+                trace!(target: TAG, "Dropping packet for recently closed tuple: {}", id);
+                return;
+            }
+
+            let mut just_closed: Option<ConnectionId> = None;
             match self.connections.entry(id.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let mut connection = entry.get().borrow_mut();
                     connection.send_to_network(client_channel, ip_packet);
-                    if connection.is_closed() {
+                    let closed = connection.is_closed();
+                    drop(connection);
+                    if closed {
                         debug!(target: TAG, "Removing connection from router: {}", id);
-                        drop(connection);
                         entry.remove();
+                        just_closed = Some(id.clone());
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -122,10 +152,12 @@ impl Router {
                     };
                     match Self::create_connection(id.clone(), &self.client, &buffer, ip_packet) {
                         Ok(connection) => {
-                            // El paquete que disparó la creación también tiene que reenviarse:
-                            // para TCP el SYN va sin payload y el handshake es sintético, pero
-                            // para UDP el primer paquete ES el payload. Sin esta llamada, la
-                            // primera consulta DNS (o el primer probe QUIC) se descarta.
+                            // The packet that triggered the creation must
+                            // also be forwarded: for TCP the SYN carries
+                            // no payload and the handshake is synthetic,
+                            // but for UDP the first packet IS the payload.
+                            // Without this, the first DNS query (or the
+                            // first QUIC probe) is dropped.
                             connection.borrow_mut().send_to_network(client_channel, ip_packet);
                             entry.insert(connection);
                         }
@@ -134,6 +166,9 @@ impl Router {
                         }
                     }
                 }
+            }
+            if let Some(closed) = just_closed {
+                self.recently_closed.insert(closed, Instant::now());
             }
         } else {
             // Show the protocol so we can understand exactly what is being
@@ -184,6 +219,7 @@ impl Router {
     pub fn remove(&mut self, id: &ConnectionId) {
         if self.connections.remove(id).is_some() {
             debug!(target: TAG, "Removing connection from router: {}", id);
+            self.recently_closed.insert(id.clone(), Instant::now());
         }
     }
 
@@ -192,6 +228,7 @@ impl Router {
             connection.borrow_mut().close();
         }
         self.connections.clear();
+        self.recently_closed.clear();
     }
 
     pub fn clean_expired_connections(&mut self) {
@@ -205,6 +242,7 @@ impl Router {
             if let Some(connection) = self.connections.remove(id) {
                 debug!(target: TAG, "Removing expired connection from router: {}", id);
                 connection.borrow_mut().close();
+                self.recently_closed.insert(id.clone(), Instant::now());
             }
         }
     }
@@ -237,6 +275,7 @@ impl Router {
         for id in &closed_ids {
             debug!(target: TAG, "Removing connection from router: {}", id);
             self.connections.remove(id);
+            self.recently_closed.insert(id.clone(), Instant::now());
         }
     }
 
