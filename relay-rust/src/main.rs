@@ -19,6 +19,8 @@ mod adb_monitor;
 mod cli;
 mod commands;
 mod execution_error;
+mod hotspot;
+mod wifi;
 mod logger;
 mod transport;
 
