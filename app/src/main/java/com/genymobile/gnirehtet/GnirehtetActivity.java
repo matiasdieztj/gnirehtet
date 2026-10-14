@@ -24,8 +24,18 @@ public class GnirehtetActivity extends Activity {
     public static final String EXTRA_ALLOW_APPS = "allowApps";
     public static final String EXTRA_DENY_APPS = "denyApps";
 
+    /**
+     * SSID of the dummy Wi-Fi hotspot the relay host is broadcasting. Passed
+     * as a single String extra (not an array) so it works on API 19, where
+     * `am start --esa` is not supported. When present, the client's
+     * connectivity fallback prefers this exact SSID over any other
+     * {@code gnirehtet-*} network in range.
+     */
+    public static final String EXTRA_DUMMY_WIFI_SSID = "dummyWifiSsid";
+
     private static final int VPN_REQUEST_CODE = 0;
     private static final int NOTIFICATION_PERMISSION_CODE = 1;
+    private static final int LOCATION_PERMISSION_CODE = 2;
 
     private VpnConfiguration requestedConfig;
 
@@ -33,6 +43,14 @@ public class GnirehtetActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         handleIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        Log.d(TAG, "Received request (onNewIntent) " + intent.getAction());
+        handleIntent(intent);
     }
 
     private void handleIntent(Intent intent) {
@@ -74,22 +92,50 @@ public class GnirehtetActivity extends Activity {
         if (denyApps == null) {
             denyApps = new String[0];
         }
-        return new VpnConfiguration(Net.toInetAddresses(dnsServers), Net.toCIDRs(routes), proxyHostPort, proxyExclusionList, mtu, allowApps, denyApps);
+        // getStringExtra returns null when the extra is absent, which is the
+        // correct "no preference" value for the connectivity fallback.
+        String dummyWifiSsid = intent.getStringExtra(EXTRA_DUMMY_WIFI_SSID);
+        return new VpnConfiguration(
+                Net.toInetAddresses(dnsServers),
+                Net.toCIDRs(routes),
+                proxyHostPort,
+                proxyExclusionList,
+                mtu,
+                allowApps,
+                denyApps,
+                dummyWifiSsid);
     }
 
     private boolean startGnirehtet(VpnConfiguration config) {
-        // Request notification permission on Android 13+ before starting the VPN
-        if (Build.VERSION.SDK_INT >= 33) {
-            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                    != PackageManager.PERMISSION_GRANTED) {
-                this.requestedConfig = config;
-                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
-                        NOTIFICATION_PERMISSION_CODE);
-                return false;
-            }
+    // Request notification permission on Android 13+ before starting the VPN
+    if (Build.VERSION.SDK_INT >= 33) {
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            this.requestedConfig = config;
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                    NOTIFICATION_PERMISSION_CODE);
+            return false;
         }
+    }
 
-        Intent vpnIntent = VpnService.prepare(this);
+    // Location permission is required on API 23+ for the connectivity
+    // fallback to work at all:
+    //   - WifiManager.getConfiguredNetworks() and addNetwork() throw
+    //     SecurityException without it (kills Fallback 1 and Fallback 4).
+    //   - WifiManager.getScanResults() returns an empty list (kills Fallback 4).
+    //   - WifiManager.startLocalOnlyHotspot() throws (kills Fallback 3).
+    // Request it before attempting VpnService.prepare().
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED) {
+            this.requestedConfig = config;
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
+                    LOCATION_PERMISSION_CODE);
+            return false;
+        }
+    }
+
+    Intent vpnIntent = VpnService.prepare(this);
         if (vpnIntent == null) {
             GnirehtetService.start(this, config);
             return true;
@@ -102,12 +148,18 @@ public class GnirehtetActivity extends Activity {
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        if (requestCode == NOTIFICATION_PERMISSION_CODE) {
-            Log.d(TAG, "Notification permission granted: " + (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED));
-            // Proceed with VPN start regardless of permission result
+        if (requestCode == NOTIFICATION_PERMISSION_CODE
+                || requestCode == LOCATION_PERMISSION_CODE) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            Log.d(TAG, "Permission result for code " + requestCode + ": granted=" + granted);
             if (requestedConfig != null) {
-                startGnirehtet(requestedConfig);
-                requestedConfig = null;
+            VpnConfiguration config = requestedConfig;
+            requestedConfig = null;
+            // Re-enter startGnirehtet: it will re-check all permissions and
+            // chain to the next one, or proceed to VpnService.prepare() if
+            // everything is now granted.
+            startGnirehtet(config);
             }
             finish();
         }

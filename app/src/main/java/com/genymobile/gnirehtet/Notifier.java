@@ -24,10 +24,15 @@ import android.os.Build;
  *   <li>{@code PendingIntent.FLAG_IMMUTABLE} requires API 23, and is gated at API 31
  *       (the only API level where it matters for foreground services).</li>
  * </ul>
+ *
+ * <p>All APIs used here are framework APIs ({@code android.app.*}), not AndroidX.
+ * The project does not depend on AndroidX, so {@code NotificationCompat} is
+ * unavailable. Do not introduce it.
  */
 public class Notifier {
 
     private static final int NOTIFICATION_ID = 42;
+    private static final int NOTIFICATION_ID_DUMMY_WIFI = 2;
     private static final String CHANNEL_ID = "Gnirehtet";
 
     private final Service context;
@@ -132,6 +137,26 @@ public class Notifier {
             Notification notification = createNotification(failure);
             getNotificationManager().notify(NOTIFICATION_ID, notification);
         }
+    }
+
+    /**
+     * Show a notification informing the user that no active network is
+     * available and that a Wi-Fi connection is required for apps to work.
+     *
+     * <p>This is the last resort of the connectivity fallback chain: Wi-Fi
+     * Direct and open-AP auto-connect both failed, so the only remaining
+     * option is a manual Wi-Fi connection.
+     */
+    public void showDummyWifiRequired() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            createNotificationChannel();
+        }
+        Notification.Builder builder = createNotificationBuilder();
+        builder.setContentTitle(context.getString(R.string.app_name));
+        builder.setContentText(context.getString(R.string.dummy_wifi_required));
+        builder.setSmallIcon(R.drawable.ic_report_problem_24dp);
+        builder.setPriority(Notification.PRIORITY_HIGH);
+        getNotificationManager().notify(NOTIFICATION_ID_DUMMY_WIFI, builder.build());
     }
 
     private NotificationManager getNotificationManager() {

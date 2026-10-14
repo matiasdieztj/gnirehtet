@@ -3,4 +3,5 @@
     <string name="relay_connected">Reverse tethering enabled</string>
     <string name="relay_disconnected">Disconnected from the relay server</string>
     <string name="stop_vpn">Stop Gnirehtet</string>
+    <string name="dummy_wifi_required">No active network. Connect a Wi-Fi network to enable apps.</string>
 </resources>

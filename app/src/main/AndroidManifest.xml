@@ -13,6 +13,26 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!--
+      Connectivity fallback permissions. Needed on API 19-20 and API 31+,
+      where a VPN-only transport is not promoted to the system default
+      network and apps gate on getActiveNetworkInfo() being non-null.
+
+      ACCESS_WIFI_STATE  — WifiManager.getScanResults(), WifiP2pManager
+      CHANGE_WIFI_STATE  — WifiP2pManager.createGroup(), WifiManager.addNetwork()/enableNetwork()
+      ACCESS_FINE_LOCATION (maxSdkVersion=22) — declarative only; runtime
+        permissions do not exist before API 23, so no prompt is ever shown.
+      uses-feature wifi.direct required=false — tells the Play Store not to
+        filter the app on devices lacking Wi-Fi Direct (e.g. Fire HD 8).
+    -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-feature
+        android:name="android.hardware.wifi.direct"
+        android:required="false" />
+
+    <!--
       android:icon="@null" is intentional. gnirehtet is launched via adb
       commands (com.genymobile.gnirehtet.START), not from a launcher, so it
       ships without a launcher icon. Do not replace with a mipmap reference

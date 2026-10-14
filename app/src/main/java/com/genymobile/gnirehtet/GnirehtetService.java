@@ -48,6 +48,28 @@ public class GnirehtetService extends VpnService {
 
     private static final InetAddress VPN_ADDRESS = Net.toInetAddress(new byte[] {10, 0, 0, 2});
 
+    /**
+     * Google account stack packages that must be excluded from the VPN.
+     *
+     * <p>GMS's native AccountManager add-account flow refuses to run when
+     * the default network is a VPN-only transport, even when the VPN
+     * reports {@code VALIDATED}. Chrome's own HTTPS login at
+     * accounts.google.com succeeds through the tunnel, confirming that the
+     * transport itself is healthy — the failure is specific to GMS's
+     * network-type check.
+     *
+     * <p>Excluding these packages makes them use the physical WiFi
+     * directly (which, for the relay-created dummy hotspot, has its own
+     * NAT to the internet via {@code ipv4.method shared}). Their traffic
+     * no longer goes through gnirehtet; this is acceptable for account
+     * operations.
+     */
+    private static final String[] ACCOUNT_STACK_PACKAGES = {
+            "com.google.android.gms",
+            "com.android.vending",
+            "com.google.android.gsf",
+    };
+
     private final Notifier notifier = new Notifier(this);
     private final Handler handler = new RelayTunnelConnectionStateHandler(this);
 
@@ -99,10 +121,45 @@ public class GnirehtetService extends VpnService {
                 config = new VpnConfiguration();
             }
             startVpn(config);
+
+            // Ensure the framework reports an active network so that apps
+            // gating on ConnectivityManager.getActiveNetworkInfo() proceed to
+            // open sockets. On KitKat (API 19-20) and Android 12+ (API 31+),
+            // a VPN-only transport is not promoted to the system default, so
+            // this fallback is required. It runs in the background to avoid
+            // blocking the main thread (createGroup / hotspot start are async
+            // and can take a few seconds).
+            //
+            // The preferred SSID comes from the relay via an intent extra
+            // (`--es dummyWifiSsid <ssid>`). When present, it pins the client
+            // to the hotspot of the host it is USB-connected to, which
+            // matters when several hosts broadcast `gnirehtet-*` networks in
+            // range. When null, the fallback picks any `gnirehtet-*` network,
+            // then any open AP.
+            final String preferredSsid = config.getDummyWifiSsid();
+            new Thread(() -> {
+                ConnectivityFallback fallback =
+                        new ConnectivityFallback(GnirehtetService.this, preferredSsid);
+                if (!fallback.ensureActiveTransport()) {
+                    Log.w(TAG, "No active transport available — user may need to connect Wi-Fi manually");
+                    notifier.showDummyWifiRequired();
+                }
+            }, "ConnectivityFallback").start();
         } else if (ACTION_CLOSE_VPN.equals(action)) {
             close();
         }
         return START_NOT_STICKY;
+    }
+
+    @Override
+    public void onRevoke() {
+        Log.d(TAG, "VPN revoked by another VPN service");
+        // Restore the network the user was on before gnirehtet switched to
+        // the relay's dummy AP. Safe to call even if no previous SSID was
+        // saved — restorePreviousNetwork() is a no-op in that case.
+        ConnectivityFallback.restorePreviousNetwork(this);
+        close();
+        super.onRevoke();
     }
 
     private boolean isRunning() {
@@ -175,7 +232,8 @@ public class GnirehtetService extends VpnService {
             builder.setMtu(config.getMtu());
         }
 
-        // Indicar al sistema que la VPN no tiene límite de datos (para descargas en Play Store y Galaxy Store)
+        // Tell the system the VPN is unmetered, so that downloads in Play Store
+        // and Galaxy Store are not blocked by a metered-connection policy.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             builder.setMetered(false);
         }
@@ -194,13 +252,24 @@ public class GnirehtetService extends VpnService {
         // Per-app routing requires API 21+. On API 19-20 all apps go through
         // the VPN unconditionally. This is a functional limitation, not a bug:
         // the platform simply does not offer per-app routing at that API level.
+        //
+        // In the "no filter" and "deny list" cases, the Google account stack
+        // is force-excluded so that GMS's add-account flow can use the
+        // physical WiFi directly. In the "allow list" case, GMS is already
+        // implicitly excluded (it is not in the list) so no change is needed.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             try {
-                for (String pkg : config.getAllowApps()) {
-                    builder.addAllowedApplication(pkg);
-                }
-                for (String pkg : config.getDenyApps()) {
-                    builder.addDisallowedApplication(pkg);
+                if (config.getAllowApps().length > 0) {
+                    for (String pkg : config.getAllowApps()) {
+                        builder.addAllowedApplication(pkg);
+                    }
+                } else {
+                    for (String pkg : ACCOUNT_STACK_PACKAGES) {
+                        builder.addDisallowedApplication(pkg);
+                    }
+                    for (String pkg : config.getDenyApps()) {
+                        builder.addDisallowedApplication(pkg);
+                    }
                 }
             } catch (NameNotFoundException e) {
                 Log.w(TAG, "Package not found for per-app routing", e);
@@ -298,6 +367,8 @@ public class GnirehtetService extends VpnService {
         } catch (IOException e) {
             Log.w(TAG, "Cannot close VPN file descriptor", e);
         }
+
+        ConnectivityFallback.restorePreviousNetwork(this);
     }
 
     private static final class RelayTunnelConnectionStateHandler extends Handler {
