@@ -419,9 +419,9 @@ pub fn detect_mtu() -> u16 {
 /// visible in the relay log.
 fn grant_runtime_permissions(serial: Option<&str>, sdk: u32) {
     if sdk >= 23 {
-        for perm in &[
-            "android.permission.ACCESS_FINE_LOCATION",
-            "android.permission.ACCESS_COARSE_LOCATION",
+        for (perm, op) in &[
+            ("android.permission.ACCESS_FINE_LOCATION", "FINE_LOCATION"),
+            ("android.permission.ACCESS_COARSE_LOCATION", "COARSE_LOCATION"),
         ] {
             debug!(target: TAG, "Granting {} (package + uid)", perm);
             if let Err(e) = exec_adb(serial, vec![
@@ -429,9 +429,6 @@ fn grant_runtime_permissions(serial: Option<&str>, sdk: u32) {
             ]) {
                 warn!(target: TAG, "pm grant {} failed: {}", perm, e);
             }
-            // Strip the "android.permission." prefix to get the appops
-            // op name (e.g. ACCESS_FINE_LOCATION).
-            let op = perm.strip_prefix("android.permission.").unwrap_or(perm);
             if let Err(e) = exec_adb(serial, vec![
                 "shell", "appops", "set", "--uid", GNIREHTET_PKG, op, "allow",
             ]) {
@@ -451,9 +448,17 @@ fn grant_runtime_permissions(serial: Option<&str>, sdk: u32) {
 /// "Connection request" dialog that otherwise blocks the client on the
 /// first launch after install.
 ///
+/// The `appops` shell command was introduced in API 23. On older versions
+/// (KitKat, Lollipop) the VPN confirmation dialog is strictly interactive:
+/// the user must tap "OK" once after the first install. The authorization
+/// persists across app restarts, but is lost if the package is uninstalled.
+///
 /// Best-effort: some ROMs restrict WRITE_SECURE_SETTINGS to root, in which
 /// case the dialog still appears and the user must tap "OK" once.
-fn grant_vpn_permission(serial: Option<&str>) {
+fn grant_vpn_permission(serial: Option<&str>, sdk: u32) {
+    if sdk < 23 {
+        return;
+    }
     let _ = exec_adb(serial, vec![
         "shell", "appops", "set", GNIREHTET_PKG, "ACTIVATE_VPN", "allow",
     ]);
@@ -669,7 +674,7 @@ pub fn cmd_start(
     // outside of this relay's control.
     let sdk = crate::transport::query_device_sdk(serial).unwrap_or(0);
     grant_runtime_permissions(serial, sdk);
-    grant_vpn_permission(serial);
+    grant_vpn_permission(serial, sdk);
 
     info!(target: TAG, "Starting client...");
     if let Some(ssid) = dummy_wifi_ssid {
@@ -943,13 +948,21 @@ pub fn cmd_run(
     // still blocked in accept() and joining would hang forever. Only
     // join when the thread has already finished, which is a safe
     // non-blocking operation.
-    if relay_thread.is_finished() {
+    let exit_code = if relay_thread.is_finished() {
         match relay_thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => error!(target: TAG, "Relay exited with error: {}", err),
-            Err(_) => error!(target: TAG, "Relay thread panicked"),
+            Ok(Ok(())) => 0,
+            Ok(Err(err)) => {
+                error!(target: TAG, "Relay exited with error: {}", err);
+                1
+            }
+            Err(_) => {
+                error!(target: TAG, "Relay thread panicked");
+                1
+            }
         }
-    }
+    } else {
+        0
+    };
 
     // ── Teardown ──
     if let Some(ref h) = outcome.hotspot
@@ -958,11 +971,7 @@ pub fn cmd_run(
         warn!(target: TAG, "Failed to stop dummy Wi-Fi hotspot: {}", e);
     }
 
-    // The relay thread may still be blocked in accept(). Do NOT join it:
-    // that would hang. std::process::exit kills it safely — the hotspot
-    // has already been stopped above, and cmd_stop has already told the
-    // device to tear down the VPN.
-    std::process::exit(0);
+    std::process::exit(exit_code);
 }
 
 #[allow(clippy::too_many_arguments)]
