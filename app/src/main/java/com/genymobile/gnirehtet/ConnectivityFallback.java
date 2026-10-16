@@ -223,7 +223,7 @@ public class ConnectivityFallback {
             return;
         }
 
-        String currentSsid = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
+        String currentSsid = getConnectedSsid(context);
         if (previousSsid.equals(currentSsid)) {
             Log.d(TAG, "Already on previous network '" + previousSsid + "'");
             prefs.edit().remove(KEY_PREVIOUS_SSID).apply();
@@ -343,7 +343,7 @@ public class ConnectivityFallback {
         boolean associated = false;
 
         while (System.currentTimeMillis() < deadline) {
-            String current = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
+            String current = getConnectedSsid(context);
 
             if (!associated) {
                 if (targetSsid.equals(current)) {
@@ -388,7 +388,7 @@ public class ConnectivityFallback {
             }
         }
 
-        String current = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
+        String current = getConnectedSsid(context);
         if (!targetSsid.equals(current)) {
             Log.w(TAG, "Timed out: suggestion did not lead to association with '"
                     + targetSsid + "' (current SSID='" + current + "')");
@@ -914,15 +914,70 @@ private static boolean hasP2pInterface() {
         return wifiManager.addNetwork(config);
     }
 
-    @SuppressWarnings("deprecation")
     private boolean isConnectedToSsid(String ssid) {
+        return ssid.equals(getConnectedSsid(context));
+    }
+
+    /**
+     * Return the SSID of the Wi-Fi network the device is currently
+     * associated with, or null if none.
+     *
+     * <p>On API 29+, the framework may report an association through
+     * ConnectivityManager while WifiManager.getConnectionInfo() still says
+     * "<unknown ssid>" — in particular when a VPN is active and has claimed
+     * a suggested Wi-Fi network as its underlying transport. The suggested
+     * network is present in ConnectivityManager.getAllNetworks() with its
+     * SSID exposed through WifiInfo, which is the source we trust on
+     * modern platforms.
+     *
+     * <p>Below API 29 the legacy WifiManager.getConnectionInfo() path is
+     * used, since it is the only one available and is known to work there.
+     */
+    @SuppressWarnings("deprecation")
+    private static String getConnectedSsid(Context context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ConnectivityManager cm = (ConnectivityManager)
+                    context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                Network[] networks = cm.getAllNetworks();
+                if (networks != null) {
+                    for (Network network : networks) {
+                        NetworkCapabilities caps = cm.getNetworkCapabilities(network);
+                        if (caps == null) {
+                            continue;
+                        }
+                        if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                            continue;
+                        }
+                        // Skip the VPN, which can carry a synthetic WiFi
+                        // transport alongside TRANSPORT_VPN.
+                        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                            continue;
+                        }
+                        android.net.TransportInfo ti = caps.getTransportInfo();
+                        if (ti instanceof android.net.wifi.WifiInfo) {
+                            String ssid = normalizeSsid(
+                                    ((android.net.wifi.WifiInfo) ti).getSSID());
+                            if (ssid != null
+                                    && !ssid.isEmpty()
+                                    && !"<unknown ssid>".equals(ssid)) {
+                                return ssid;
+                            }
+                        }
+                    }
+                }
+            }
+            // Fall through to WifiManager as a secondary source. It is
+            // known to be masked when a VPN is active, but there is no
+            // harm in trying.
+        }
+
         WifiManager wifiManager = (WifiManager)
                 context.getSystemService(Context.WIFI_SERVICE);
         if (wifiManager == null) {
-            return false;
+            return null;
         }
-        String current = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
-        return ssid.equals(current);
+        return normalizeSsid(wifiManager.getConnectionInfo().getSSID());
     }
 
     private static String normalizeSsid(String ssid) {
@@ -935,14 +990,8 @@ private static boolean hasP2pInterface() {
         return ssid;
     }
 
-    @SuppressWarnings("deprecation")
     private void saveCurrentSsid() {
-        WifiManager wifiManager = (WifiManager)
-                context.getSystemService(Context.WIFI_SERVICE);
-        if (wifiManager == null) {
-            return;
-        }
-        String current = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
+        String current = getConnectedSsid(context);
         if (current == null || current.isEmpty() || "<unknown ssid>".equals(current)) {
             return;
         }
@@ -985,7 +1034,7 @@ private static boolean hasP2pInterface() {
 
         while (System.currentTimeMillis() < deadline) {
             if (wifiManager != null && targetSsid != null) {
-                String current = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
+                String current = getConnectedSsid(context);
                 if (!associated) {
                     if (targetSsid.equals(current)) {
                         associated = true;
@@ -1047,7 +1096,7 @@ private static boolean hasP2pInterface() {
 
         // One last check at the deadline.
         if (wifiManager != null && targetSsid != null) {
-            String current = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
+            String current = getConnectedSsid(context);
             if (!targetSsid.equals(current)) {
                 Log.w(TAG, "Timed out: never associated with '" + targetSsid
                         + "' (current SSID='" + current + "')");
