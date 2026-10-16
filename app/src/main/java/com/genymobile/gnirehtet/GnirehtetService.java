@@ -371,6 +371,17 @@ public class GnirehtetService extends VpnService {
         ConnectivityFallback.restorePreviousNetwork(this);
     }
 
+    @Override
+    public void onDestroy() {
+        // Safety net for abnormal termination: close() may not have run if
+        // the service was killed by the system. Network suggestions persist
+        // across reboots, so an explicit cleanup here prevents the next
+        // start from seeing stale entries and failing with
+        // ERROR_ADD_DUPLICATE.
+        ConnectivityFallback.removeAllSuggestions(this);
+        super.onDestroy();
+    }
+
     private static final class RelayTunnelConnectionStateHandler extends Handler {
 
         private final GnirehtetService vpnService;

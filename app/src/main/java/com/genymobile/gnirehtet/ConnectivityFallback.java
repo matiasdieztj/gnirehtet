@@ -202,6 +202,14 @@ public class ConnectivityFallback {
     }
 
     public static void restorePreviousNetwork(Context context) {
+        // Drop any network suggestion left over from the preferred-SSID path,
+        // unconditionally, before checking whether a previous network was
+        // saved. Suggestions persist across reboots, so the cleanup must run
+        // on every stop even when the client never switched networks.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            removeAllSuggestions(context);
+        }
+
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         String previousSsid = prefs.getString(KEY_PREVIOUS_SSID, null);
         if (previousSsid == null) {
