@@ -35,6 +35,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.net.wifi.WifiNetworkSuggestion;
+import android.net.wifi.SupplicantState;
+import android.net.wifi.WifiInfo;
 
 import java.util.List;
 import java.util.Collections;
@@ -44,6 +46,7 @@ import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.util.Enumeration;
+import java.lang.reflect.Method;
 
 /**
  * Multi-layer fallback to ensure an "active transport" exists on the device
@@ -57,11 +60,16 @@ import java.util.Enumeration;
  * is ready to route them.
  *
  * <p>When the relay passes a {@code preferredSsid} (via the
- * {@code dummyWifiSsid} intent extra), the fallback switches to that SSID
- * <b>even if another network is already active</b>. This is what makes the
- * behaviour deterministic: the active network is always the one we control.
- * The previous network is remembered in {@code SharedPreferences} and
- * restored by {@link #restorePreviousNetwork(Context)} when the VPN stops.
+ * {@code dummyWifiSsid} intent extra), the fallback tries to switch to
+ * that SSID. On API 19-28 this is a forced switch via {@code addNetwork()}
+ * and {@code enableNetwork()}; on API 29+ the SSID is registered as a
+ * {@link WifiNetworkSuggestion} and the framework decides whether to
+ * follow it. In practice the framework only switches when no other Wi-Fi
+ * network is currently connected with internet: a suggestion is treated
+ * as a preference, not a command. When the device is already on a
+ * working Wi-Fi, the dummy AP is redundant — the existing network
+ * already provides the non-VPN transport that the fallback chain needs —
+ * and {@code hasActiveTransport()} returns true on the first check.
  *
  * <p>When the preferred SSID is unavailable (relay failed to create the
  * hotspot, or it is out of range), the selection order is:
@@ -86,6 +94,7 @@ public class ConnectivityFallback {
 
     private static final String PREFS_NAME = "gnirehtet_prefs";
     private static final String KEY_PREVIOUS_SSID = "previous_ssid";
+    private static final String KEY_ENABLED_NETWORK_IDS = "enabled_network_ids";
 
     private static final long CREATE_TIMEOUT_MS = 3000;
     private static final long TRANSPORT_POLL_TIMEOUT_MS = 2000;
@@ -223,7 +232,14 @@ public class ConnectivityFallback {
             return;
         }
 
+        // KitKat: enableNetwork(..., true) permanently disabled every other
+        // WiFi configuration. Restore them before attempting to switch back.
+        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.KITKAT) {
+            reEnableRememberedNetworks(context, wifiManager);
+        }
+
         String currentSsid = getConnectedSsid(context);
+        Log.d(TAG, "Restore: previous='" + previousSsid + "' current='" + currentSsid + "'");
         if (previousSsid.equals(currentSsid)) {
             Log.d(TAG, "Already on previous network '" + previousSsid + "'");
             prefs.edit().remove(KEY_PREVIOUS_SSID).apply();
@@ -231,25 +247,257 @@ public class ConnectivityFallback {
         }
 
         Log.d(TAG, "Restoring previous network '" + previousSsid + "'");
-        try {
-            List<WifiConfiguration> configured = wifiManager.getConfiguredNetworks();
-            if (configured != null) {
-                for (WifiConfiguration config : configured) {
-                    if (previousSsid.equals(normalizeSsid(config.SSID))) {
-                        // enableNetwork with disableOthers=true atomically
-                        // switches from the current network to this one.
-                        // Do NOT call disconnect() first: on KitKat, an
-                        // explicit disconnect races with the enableNetwork
-                        // state transition and can leave the framework idle.
-                        wifiManager.enableNetwork(config.networkId, true);
-                        break;
+
+        // Locate the netId for the previous SSID. On KitKat the WiFi config
+        // list can be briefly inconsistent after a network switch, so the
+        // lookup is retried a few times before giving up.
+        int netId = -1;
+        for (int attempt = 1; attempt <= 3 && netId == -1; attempt++) {
+            try {
+                List<WifiConfiguration> configured = wifiManager.getConfiguredNetworks();
+                if (configured != null) {
+                    for (WifiConfiguration config : configured) {
+                        if (previousSsid.equals(normalizeSsid(config.SSID))) {
+                            netId = config.networkId;
+                            break;
+                        }
                     }
                 }
+                Log.d(TAG, "Restore lookup attempt " + attempt
+                        + ": netId=" + netId
+                        + " (configured size=" + (configured == null ? "null" : configured.size()) + ")");
+            } catch (SecurityException e) {
+                Log.w(TAG, "Cannot read configured networks (attempt " + attempt + ")", e);
             }
-        } catch (SecurityException e) {
-            Log.w(TAG, "Cannot restore previous network", e);
+            if (netId == -1 && attempt < 3) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    prefs.edit().remove(KEY_PREVIOUS_SSID).apply();
+                    return;
+                }
+            }
         }
+
+        if (netId == -1) {
+            Log.w(TAG, "Previous network '" + previousSsid
+                    + "' is not in the configured-networks list; cannot restore");
+            prefs.edit().remove(KEY_PREVIOUS_SSID).apply();
+            return;
+        }
+
+        // enableNetwork with disableOthers=true atomically switches from the
+        // current network to this one. Do NOT call disconnect() first: on
+        // KitKat that races with the state machine.
+        boolean enableOk = false;
+        try {
+            enableOk = wifiManager.enableNetwork(netId, true);
+            Log.d(TAG, "enableNetwork(" + netId + ", true) returned " + enableOk);
+        } catch (SecurityException e) {
+            Log.w(TAG, "enableNetwork threw", e);
+        }
+
+        // Wait for the framework to actually associate. On KitKat the
+        // association is not triggered synchronously by enableNetwork: the
+        // framework schedules it on its own timeline. If nothing happens
+        // after 15 s, nudge with reconnect() once.
+        boolean associated = waitForAssociation(context, previousSsid, 15000);
+        if (!associated && enableOk) {
+            Log.d(TAG, "No association after 15 s; issuing reconnect() as a nudge");
+            try {
+                wifiManager.reconnect();
+            } catch (SecurityException e) {
+                Log.w(TAG, "reconnect() threw", e);
+            }
+            associated = waitForAssociation(context, previousSsid, 15000);
+        }
+
+        if (associated) {
+            Log.d(TAG, "Restored previous network '" + previousSsid + "'");
+        } else {
+            Log.w(TAG, "Could not restore previous network '" + previousSsid + "'");
+        }
+
         prefs.edit().remove(KEY_PREVIOUS_SSID).apply();
+    }
+
+    /**
+     * Re-enable the WiFi configurations that were enabled before the most
+     * recent KitKat disableOthers=true switch.
+     *
+     * <p>On KitKat, {@code enableNetwork(id, false)} does not clear the
+     * DISABLED status that a prior disableOthers=true switch set. The only
+     * reliable way is to mutate the config's status and persist it via the
+     * hidden {@code saveConfiguration(WifiConfiguration)} API.
+     */
+    @SuppressWarnings("deprecation")
+    private static void reEnableRememberedNetworks(Context context, WifiManager wifiManager) {
+        SharedPreferences prefs = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String raw = prefs.getString(KEY_ENABLED_NETWORK_IDS, null);
+        if (raw == null || raw.isEmpty()) {
+            Log.d(TAG, "No remembered network ids to re-enable");
+            return;
+        }
+
+        List<WifiConfiguration> configured;
+        try {
+            configured = wifiManager.getConfiguredNetworks();
+        } catch (SecurityException e) {
+            Log.w(TAG, "Cannot list configured networks to re-enable", e);
+            return;
+        }
+        if (configured == null) {
+            Log.w(TAG, "Cannot re-enable: configured list is null");
+            return;
+        }
+
+        // saveConfiguration() is hidden and not present on every KitKat ROM
+        // (Fire OS 4 in particular lacks it). updateNetwork() is the public
+        // API 23+ equivalent and exists as a hidden method since API 1, so
+        // reflection usually reaches it. If neither is available, fall back
+        // to enableNetwork(id, false).
+        Method saveMethod = null;
+        String methodName = null;
+        try {
+            saveMethod = WifiManager.class.getMethod(
+                    "saveConfiguration", WifiConfiguration.class);
+            methodName = "saveConfiguration";
+        } catch (NoSuchMethodException e) {
+            try {
+                saveMethod = WifiManager.class.getMethod(
+                        "updateNetwork", WifiConfiguration.class);
+                methodName = "updateNetwork";
+            } catch (NoSuchMethodException e2) {
+                Log.w(TAG, "Neither saveConfiguration() nor updateNetwork() "
+                        + "available; falling back to enableNetwork");
+            }
+        }
+
+        int reenabled = 0;
+        for (String part : raw.split(",")) {
+            int id;
+            try {
+                id = Integer.parseInt(part.trim());
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            for (WifiConfiguration config : configured) {
+                if (config.networkId != id) {
+                    continue;
+                }
+                boolean ok = false;
+                if (config.status != WifiConfiguration.Status.ENABLED) {
+                    config.status = WifiConfiguration.Status.ENABLED;
+                    if (saveMethod != null) {
+                        try {
+                            Object result = saveMethod.invoke(wifiManager, config);
+                            if ("updateNetwork".equals(methodName)) {
+                                // updateNetwork returns the netId (>=0) on
+                                // success, -1 on failure.
+                                ok = (result instanceof Integer)
+                                        && ((Integer) result) >= 0;
+                            } else {
+                                ok = Boolean.TRUE.equals(result);
+                            }
+                        } catch (Exception e) {
+                            Log.w(TAG, methodName + " threw for id " + id, e);
+                        }
+                    }
+                }
+                if (!ok) {
+                    try {
+                        ok = wifiManager.enableNetwork(id, false);
+                    } catch (SecurityException e) {
+                        Log.w(TAG, "enableNetwork(" + id + ", false) threw", e);
+                    }
+                }
+                if (ok) {
+                    reenabled++;
+                }
+                break;
+            }
+        }
+        Log.d(TAG, "Re-enabled " + reenabled + " network(s) via "
+                + (methodName != null ? methodName : "enableNetwork"));
+        prefs.edit().remove(KEY_ENABLED_NETWORK_IDS).apply();
+    }
+
+    /**
+     * Poll until the supplicant reports the target SSID as fully connected.
+     *
+     * <p>Do not trust WifiInfo.getSSID() alone on KitKat: the framework
+     * updates that field as soon as the "preferred" configuration changes,
+     * even before the supplicant has associated. The reliable signals are
+     * SupplicantState.COMPLETED together with a non-negative network id.
+     */
+    @SuppressWarnings("deprecation")
+    private static boolean waitForAssociation(
+            Context context, String targetSsid, long timeoutMs) {
+        WifiManager wifiManager = (WifiManager)
+                context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wifiManager == null) {
+            return false;
+        }
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            WifiInfo info = wifiManager.getConnectionInfo();
+            if (info != null) {
+                String current = normalizeSsid(info.getSSID());
+                SupplicantState state = info.getSupplicantState();
+                int netId = info.getNetworkId();
+                if (targetSsid.equals(current)
+                        && state == SupplicantState.COMPLETED
+                        && netId != -1) {
+                    Log.d(TAG, "Association confirmed: SSID='" + current
+                            + "' state=" + state + " netId=" + netId);
+                    return true;
+                }
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        WifiInfo last = wifiManager.getConnectionInfo();
+        if (last != null) {
+            Log.w(TAG, "Association not confirmed within " + timeoutMs
+                    + " ms: SSID='" + normalizeSsid(last.getSSID())
+                    + "' state=" + last.getSupplicantState()
+                    + " netId=" + last.getNetworkId());
+        }
+        return false;
+    }
+
+    /**
+     * Return true only when the supplicant reports the target SSID as
+     * fully connected. On KitKat, WifiInfo.getSSID() returns the
+     * "preferred" SSID as soon as enableNetwork() is called, before any
+     * actual association. SupplicantState.COMPLETED together with a
+     * non-negative network id is the reliable signal.
+     */
+    @SuppressWarnings("deprecation")
+    private static boolean isFullyAssociated(WifiManager wifiManager, String targetSsid) {
+        WifiInfo info = wifiManager.getConnectionInfo();
+        if (info == null) {
+            return false;
+        }
+        String current = normalizeSsid(info.getSSID());
+        String bssid = info.getBSSID();
+        // KitKat sets SupplicantState to COMPLETED and returns the target
+        // netId as soon as enableNetwork() is called, before the supplicant
+        // has actually associated. Requiring a valid BSSID filters out that
+        // "optimistic" state: a real association always has a non-empty,
+        // non-zero BSSID.
+        return targetSsid.equals(current)
+                && info.getSupplicantState() == SupplicantState.COMPLETED
+                && info.getNetworkId() != -1
+                && bssid != null
+                && !bssid.isEmpty()
+                && !"00:00:00:00:00:00".equals(bssid);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -283,7 +531,7 @@ public class ConnectivityFallback {
             return tryConnectViaSuggestion(wifiManager, preferredSsid);
         }
 
-        if (!tryConnectBySsid(wifiManager, preferredSsid)) {
+        if (!tryConnectBySsid(context, wifiManager, preferredSsid)) {
             Log.w(TAG, "Cannot add/connect network '" + preferredSsid + "'");
             return false;
         }
@@ -346,8 +594,9 @@ public class ConnectivityFallback {
             String current = getConnectedSsid(context);
 
             if (!associated) {
-                if (targetSsid.equals(current)) {
-                    associated = true;
+                    if (targetSsid.equals(current)
+                            && isFullyAssociated(wifiManager, targetSsid)) {
+                        associated = true;
                     deadline = System.currentTimeMillis() + SSID_DHCP_TIMEOUT_MS;
                     Log.d(TAG, "Associated with '" + targetSsid + "'; waiting for framework");
                 } else {
@@ -376,10 +625,22 @@ public class ConnectivityFallback {
                 }
             }
 
-            if (associated && hasActiveTransport()) {
-                return true;
-            }
-
+                // Once associated, decide whether the transport is usable.
+                if (associated) {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+                        // On KitKat, getActiveNetworkInfo() is unreliable
+                        // while a VPN is active: the VPN obscures the
+                        // underlying WiFi transport, and the framework
+                        // transiently reports no active network during
+                        // network transitions. The WiFi association
+                        // itself (SupplicantState.COMPLETED with a valid
+                        // netId) is the reliable signal.
+                        return true;
+                    }
+                    if (hasActiveTransport()) {
+                        return true;
+                    }
+                }
             try {
                 Thread.sleep(POLL_INTERVAL_MS);
             } catch (InterruptedException e) {
@@ -486,7 +747,7 @@ public class ConnectivityFallback {
             for (ScanResult result : results) {
                 if (preferredSsid.equals(result.SSID) && isOpen(result)) {
                     Log.d(TAG, "Found preferred SSID '" + preferredSsid + "' in scan");
-                    if (tryConnectBySsid(wifiManager, result.SSID)
+                    if (tryConnectBySsid(context, wifiManager, result.SSID)
                             && waitForTransport(PREFERRED_SSID_ASSOC_TIMEOUT_MS, wifiManager, result.SSID)) {
                         return true;
                     }
@@ -506,7 +767,7 @@ public class ConnectivityFallback {
         if (bestSavedSecure != null) {
             Log.d(TAG, "Trying strongest saved secure network '"
                     + bestSavedSecure.SSID + "' (signal " + bestSavedSecure.level + ")");
-            if (tryConnectBySsid(wifiManager, bestSavedSecure.SSID)
+            if (tryConnectBySsid(context, wifiManager, bestSavedSecure.SSID)
                     && waitForTransport(OPEN_AP_ASSOC_TIMEOUT_MS, wifiManager, bestSavedSecure.SSID)) {
                 return true;
             }
@@ -517,7 +778,7 @@ public class ConnectivityFallback {
         if (bestOpen != null) {
             Log.d(TAG, "Trying strongest open network '"
                     + bestOpen.SSID + "' (signal " + bestOpen.level + ")");
-            if (tryConnectBySsid(wifiManager, bestOpen.SSID)
+            if (tryConnectBySsid(context, wifiManager, bestOpen.SSID)
                     && waitForTransport(OPEN_AP_ASSOC_TIMEOUT_MS, wifiManager, bestOpen.SSID)) {
                 return true;
             }
@@ -855,18 +1116,36 @@ private static boolean hasP2pInterface() {
     }
 
     /**
-     * Connect to the given SSID.
+     * Connect to the given SSID using the legacy API 19-28 path.
      *
-     * <p>Uses {@code enableNetwork(netId, true)} alone. The {@code true}
-     * flag already disconnects from the current network and disables all
-     * other networks atomically, so we must NOT call {@code disconnect()}
-     * first — on KitKat that races with the state machine and can leave
-     * the framework idle with no pending association. Likewise,
-     * {@code reconnect()} is not called: it is for retrying a failed
-     * association and can cancel a freshly started one.
+     * <p>Before issuing enableNetwork(netId, true), record the network ids
+     * that are currently ENABLED. KitKat's disableOthers flag permanently
+     * marks the other configurations as DISABLED and does not restore them
+     * when the target network is later dropped, so the restore path must
+     * re-enable them explicitly.
      */
-    private static boolean tryConnectBySsid(WifiManager wifiManager, String ssid) {
-        int netId = findOrAddOpenNetwork(wifiManager, ssid);
+    @SuppressWarnings("deprecation")
+    private static boolean tryConnectBySsid(Context context, WifiManager wifiManager, String ssid) {
+        if (Build.VERSION.SDK_INT == Build.VERSION_CODES.KITKAT) {
+            rememberEnabledNetworks(context, wifiManager);
+        }
+
+        int netId;
+        if (ssid.startsWith(GNIREHTET_SSID_PREFIX)) {
+            // Dummy AP: recreate the config as an open network. This is
+            // safe because the relay's AP is genuinely open.
+            netId = findOrAddOpenNetwork(wifiManager, ssid);
+        } else {
+            // User network: locate the existing config and reuse it,
+            // preserving its PSK and key management.
+            netId = findExistingNetId(wifiManager, ssid);
+            if (netId == -1) {
+                Log.w(TAG, "No existing config for '" + ssid + "'; refusing to "
+                        + "create an open replacement that would drop the PSK");
+                return false;
+            }
+        }
+
         if (netId == -1) {
             return false;
         }
@@ -877,6 +1156,91 @@ private static boolean hasP2pInterface() {
         }
     }
 
+    /**
+     * Return the network id of the existing config for {@code ssid}, or -1
+     * if there is none. Does not modify or recreate the config.
+     */
+    @SuppressWarnings("deprecation")
+    private static int findExistingNetId(WifiManager wifiManager, String ssid) {
+        try {
+            List<WifiConfiguration> configured = wifiManager.getConfiguredNetworks();
+            if (configured != null) {
+                for (WifiConfiguration config : configured) {
+                    if (ssid.equals(normalizeSsid(config.SSID))) {
+                        return config.networkId;
+                    }
+                }
+            }
+        } catch (SecurityException e) {
+            Log.w(TAG, "Cannot list configured networks", e);
+        }
+        return -1;
+    }
+
+    /**
+     * Record the ids of all currently-enabled WiFi configurations in
+     * SharedPreferences. Called before a disableOthers=true switch on
+     * KitKat, so restorePreviousNetwork can re-enable them afterwards.
+     */
+    @SuppressWarnings("deprecation")
+    private static void rememberEnabledNetworks(Context context, WifiManager wifiManager) {
+        SharedPreferences prefs = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        // Only save on the FIRST call. Subsequent calls come from
+        // waitForTransport retries, whose state has already been mutated by
+        // the earlier disableOthers=true. Saving here would overwrite the
+        // good list with one that contains only the target network.
+        if (prefs.contains(KEY_ENABLED_NETWORK_IDS)) {
+            Log.d(TAG, "Enabled network ids already saved; not overwriting");
+            return;
+        }
+
+        List<WifiConfiguration> configured;
+        try {
+            configured = wifiManager.getConfiguredNetworks();
+        // ...resto sin cambios...
+        } catch (SecurityException e) {
+            Log.w(TAG, "Cannot list configured networks to remember", e);
+            return;
+        }
+        if (configured == null) {
+            Log.d(TAG, "rememberEnabledNetworks: no configured networks");
+            return;
+        }
+        StringBuilder ids = new StringBuilder();
+        int count = 0;
+        for (WifiConfiguration config : configured) {
+            if (config.status == WifiConfiguration.Status.ENABLED
+                    || config.status == WifiConfiguration.Status.CURRENT) {
+                if (count > 0) {
+                    ids.append(",");
+                }
+                ids.append(config.networkId);
+                count++;
+            }
+        }
+        context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_ENABLED_NETWORK_IDS, ids.toString())
+                .apply();
+        Log.d(TAG, "Remembered " + count + " enabled network id(s): " + ids);
+    }
+
+    /**
+     * Return the network id of an existing open-network config for {@code ssid},
+     * creating one if needed.
+     *
+     * <p>This method is DESTRUCTIVE for the target config: it removes any
+     * existing entry and recreates it as an open (no-key) network. It must
+     * only be used for the relay's own dummy AP (whose SSID always starts
+     * with {@code gnirehtet-} and is genuinely open). Applying it to a
+     * user-configured WPA network would delete the stored PSK.
+     *
+     * <p>For non-dummy SSIDs, {@link #tryConnectBySsid} locates the existing
+     * config and calls {@code enableNetwork} directly, without touching the
+     * key material.
+     */
     @SuppressWarnings("deprecation")
     private static int findOrAddOpenNetwork(WifiManager wifiManager, String ssid) {
         String quotedSsid = "\"" + ssid + "\"";
@@ -985,7 +1349,12 @@ private static boolean hasP2pInterface() {
             return null;
         }
         if (ssid.length() >= 2 && ssid.startsWith("\"") && ssid.endsWith("\"")) {
-            return ssid.substring(1, ssid.length() - 1);
+            ssid = ssid.substring(1, ssid.length() - 1);
+        }
+        // KitKat transiently returns "0x" or "<unknown ssid>" during
+        // network transitions. Both are placeholders, not real SSIDs.
+        if ("0x".equals(ssid) || "<unknown ssid>".equals(ssid)) {
+            return null;
         }
         return ssid;
     }
@@ -1057,7 +1426,7 @@ private static boolean hasP2pInterface() {
                         // attempts.
                         if (now - lastRetry > 12000) {
                             Log.d(TAG, "Re-issuing enableNetwork for '" + targetSsid + "'");
-                            tryConnectBySsid(wifiManager, targetSsid);
+                            tryConnectBySsid(context, wifiManager, targetSsid);
                             lastRetry = now;
                         }
                         if (now - lastLog > 3000) {
@@ -1073,10 +1442,21 @@ private static boolean hasP2pInterface() {
                         continue;
                     }
                 }
-                // Once associated, keep polling until the framework also
-                // reports an active network. This is what apps gate on.
-                if (associated && hasActiveTransport()) {
-                    return true;
+                // Once associated, decide whether the transport is usable.
+                if (associated) {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+                        // On KitKat, getActiveNetworkInfo() is unreliable
+                        // while a VPN is active: the VPN obscures the
+                        // underlying WiFi transport, and the framework
+                        // transiently reports no active network during
+                        // network transitions. The WiFi association
+                        // itself (SupplicantState.COMPLETED with a valid
+                        // netId) is the reliable signal.
+                        return true;
+                    }
+                    if (hasActiveTransport()) {
+                        return true;
+                    }
                 }
             } else {
                 // No SSID tracking (P2P / local-only hotspot): the original
@@ -1097,7 +1477,8 @@ private static boolean hasP2pInterface() {
         // One last check at the deadline.
         if (wifiManager != null && targetSsid != null) {
             String current = getConnectedSsid(context);
-            if (!targetSsid.equals(current)) {
+            if (!targetSsid.equals(current)
+                    || !isFullyAssociated(wifiManager, targetSsid)) {
                 Log.w(TAG, "Timed out: never associated with '" + targetSsid
                         + "' (current SSID='" + current + "')");
                 return false;
