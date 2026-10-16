@@ -34,8 +34,10 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.net.wifi.WifiNetworkSuggestion;
 
 import java.util.List;
+import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.net.InetAddress;
@@ -97,6 +99,29 @@ public class ConnectivityFallback {
      * on fast devices.
      */
     private static final long PREFERRED_SSID_ASSOC_TIMEOUT_MS = 45000;
+
+
+    /**
+     * Poll timeout for the suggestion-based path on API 29+.
+     *
+     * <p>The framework schedules the scan that discovers a suggested AP on
+     * its own timeline; on the A21s the observed delay between
+     * {@code addNetworkSuggestions()} and {@code CMD_START_CONNECT} was
+     * around 60 seconds. 90 seconds leaves room for a slower device
+     * without blocking the fallback chain for too long.
+     */
+    private static final long SUGGESTION_ASSOC_TIMEOUT_MS = 90000;
+
+    /**
+     * Interval between best-effort {@code startScan()} calls while waiting
+     * for the framework to associate with a suggested network.
+     *
+     * <p>{@code startScan()} may be silently throttled by the platform, so
+     * it is called as a hint, not as a guarantee. The poll loop re-reads
+     * {@code getConnectionInfo()} regardless of whether the scan call was
+     * accepted.
+     */
+    private static final long SUGGESTION_SCAN_INTERVAL_MS = 20000;
 
     /**
      * Poll timeout for the DHCP / post-association handshake, applied AFTER
@@ -224,9 +249,16 @@ public class ConnectivityFallback {
     // ═══════════════════════════════════════════════════════════════════
 
     /**
-     * Connect to the SSID the relay asked for. Uses a longer timeout than
-     * the generic path, because on KitKat the association + DHCP sequence
-     * against a freshly created AP regularly takes more than 5 seconds.
+     * Connect to the SSID the relay asked for.
+     *
+     * <p>Two paths depending on the API level:
+     * <ul>
+     *   <li><b>API 29 and above:</b> {@code WifiNetworkSuggestion}. The app
+     *       hands the SSID to the framework and waits for the framework to
+     *       associate. The app cannot force the switch.</li>
+     *   <li><b>API 19-28:</b> {@code addNetwork()} + {@code enableNetwork()}.
+     *       The app creates and activates the config itself.</li>
+     * </ul>
      */
     private boolean tryConnectToPreferredSsid() {
         WifiManager wifiManager = (WifiManager)
@@ -239,12 +271,176 @@ public class ConnectivityFallback {
             return false;
         }
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return tryConnectViaSuggestion(wifiManager, preferredSsid);
+        }
+
         if (!tryConnectBySsid(wifiManager, preferredSsid)) {
             Log.w(TAG, "Cannot add/connect network '" + preferredSsid + "'");
             return false;
         }
 
         return waitForTransport(PREFERRED_SSID_ASSOC_TIMEOUT_MS, wifiManager, preferredSsid);
+    }
+
+    /**
+     * API 29+ path: register the preferred SSID as a network suggestion and
+     * wait for the framework to associate with it.
+     *
+     * <p>The suggestion is registered with {@code setIsAppInteractionRequired(false)}
+     * and {@code setIsUserInteractionRequired(false)}. On the first run per
+     * package the system still shows a one-time approval dialog ("Allow
+     * suggested Wi-Fi networks?"); once accepted, subsequent runs are
+     * silent. The dialog is a platform requirement and cannot be bypassed
+     * from inside the app.
+     */
+    private boolean tryConnectViaSuggestion(WifiManager wifiManager, String ssid) {
+        // Remove any suggestion left behind by a previous run so the framework
+        // does not keep trying to associate with a stale SSID, and so that
+        // addNetworkSuggestions does not report ERROR_ADD_DUPLICATE.
+        removeAllSuggestions(context);
+
+        WifiNetworkSuggestion suggestion = new WifiNetworkSuggestion.Builder()
+                .setSsid(ssid)
+                .setIsAppInteractionRequired(false)
+                .setIsUserInteractionRequired(false)
+                .build();
+
+        int result = wifiManager.addNetworkSuggestions(
+                Collections.singletonList(suggestion));
+        Log.d(TAG, "addNetworkSuggestions() returned " + describeSuggestionResult(result));
+
+        if (result != WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS) {
+            Log.w(TAG, "Suggestion was rejected; cannot use the API 29+ path");
+            return false;
+        }
+
+        return waitForSuggestionTransport(SUGGESTION_ASSOC_TIMEOUT_MS, wifiManager, ssid);
+    }
+
+    /**
+     * Wait until the framework associates with the suggested SSID.
+     *
+     * <p>Unlike {@link #waitForTransport}, this loop cannot re-issue
+     * {@code enableNetwork()} because the app does not control a network id.
+     * Instead it calls {@code startScan()} periodically as a hint; the
+     * framework will still decide on its own schedule.
+     */
+    @SuppressWarnings("deprecation")
+    private boolean waitForSuggestionTransport(
+            long timeoutMs, WifiManager wifiManager, String targetSsid) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        long lastLog = 0;
+        long lastScan = 0;
+        boolean associated = false;
+
+        while (System.currentTimeMillis() < deadline) {
+            String current = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
+
+            if (!associated) {
+                if (targetSsid.equals(current)) {
+                    associated = true;
+                    deadline = System.currentTimeMillis() + SSID_DHCP_TIMEOUT_MS;
+                    Log.d(TAG, "Associated with '" + targetSsid + "'; waiting for framework");
+                } else {
+                    long now = System.currentTimeMillis();
+                    if (now - lastScan > SUGGESTION_SCAN_INTERVAL_MS) {
+                        try {
+                            wifiManager.startScan();
+                            Log.d(TAG, "startScan() issued while waiting for suggestion");
+                        } catch (SecurityException e) {
+                            Log.w(TAG, "startScan rejected: " + e.getMessage());
+                        }
+                        lastScan = now;
+                    }
+                    if (now - lastLog > 5000) {
+                        Log.d(TAG, "Waiting for suggested '" + targetSsid
+                                + "'; current SSID='" + current + "'");
+                        lastLog = now;
+                    }
+                    try {
+                        Thread.sleep(POLL_INTERVAL_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                    continue;
+                }
+            }
+
+            if (associated && hasActiveTransport()) {
+                return true;
+            }
+
+            try {
+                Thread.sleep(POLL_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        String current = normalizeSsid(wifiManager.getConnectionInfo().getSSID());
+        if (!targetSsid.equals(current)) {
+            Log.w(TAG, "Timed out: suggestion did not lead to association with '"
+                    + targetSsid + "' (current SSID='" + current + "')");
+            return false;
+        }
+        if (!hasActiveTransport()) {
+            Log.w(TAG, "Timed out: associated but framework never reported connected");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Remove every network suggestion currently registered by this package.
+     *
+     * <p>Suggestions persist across reboots and across app restarts, so the
+     * app must explicitly clear them when the tunnel stops. No-op below
+     * API 29.
+     */
+    public static void removeAllSuggestions(Context context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return;
+        }
+        WifiManager wifiManager = (WifiManager)
+                context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wifiManager == null) {
+            return;
+        }
+        try {
+            List<WifiNetworkSuggestion> existing = wifiManager.getNetworkSuggestions();
+            if (existing == null || existing.isEmpty()) {
+                return;
+            }
+            int result = wifiManager.removeNetworkSuggestions(existing);
+            Log.d(TAG, "Removed " + existing.size() + " suggestion(s): "
+                    + describeSuggestionResult(result));
+        } catch (SecurityException e) {
+            Log.w(TAG, "removeNetworkSuggestions failed", e);
+        }
+    }
+
+    private static String describeSuggestionResult(int result) {
+        switch (result) {
+            case WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS:
+                return "SUCCESS";
+            case WifiManager.STATUS_NETWORK_SUGGESTIONS_ERROR_INTERNAL:
+                return "ERROR_INTERNAL";
+            case WifiManager.STATUS_NETWORK_SUGGESTIONS_ERROR_APP_DISALLOWED:
+                return "ERROR_APP_DISALLOWED";
+            case WifiManager.STATUS_NETWORK_SUGGESTIONS_ERROR_ADD_DUPLICATE:
+                return "ERROR_ADD_DUPLICATE";
+            case WifiManager.STATUS_NETWORK_SUGGESTIONS_ERROR_ADD_EXCEEDS_MAX_PER_APP:
+                return "ERROR_ADD_EXCEEDS_MAX_PER_APP";
+            case WifiManager.STATUS_NETWORK_SUGGESTIONS_ERROR_ADD_NOT_ALLOWED:
+                return "ERROR_ADD_NOT_ALLOWED";
+            case WifiManager.STATUS_NETWORK_SUGGESTIONS_ERROR_REMOVE_INVALID:
+                return "ERROR_REMOVE_INVALID";
+            default:
+                return "UNKNOWN(" + result + ")";
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
