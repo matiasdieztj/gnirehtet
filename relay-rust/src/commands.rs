@@ -399,26 +399,45 @@ pub fn detect_mtu() -> u16 {
 /// Grant runtime permissions the client needs, so the user does not have to
 /// answer system dialogs on every launch.
 ///
-/// Best-effort: failures are silent. The client falls back to requesting
-/// the permission itself if the grant does not stick.
-///
 /// ACCESS_FINE_LOCATION and ACCESS_COARSE_LOCATION are required by
-/// WifiManager.getScanResults() on API 23+. The manifest declares them
-/// without maxSdkVersion, so the system treats them as runtime grants and
-/// shows a dialog the first time the client scans.
+/// WifiManager.getScanResults() and WifiInfo.getSSID() on API 23+. Without
+/// them the SSID is silently redacted as "<unknown ssid>" and scan results
+/// come back empty, which makes the preferred-SSID fallback time out
+/// without any diagnostic.
+///
+/// Each permission is granted at two levels. `pm grant` sets the
+/// package-level op. On some ROMs (notably Samsung) the UID-level appops
+/// mode is also set to "foreground", which overrides the package op and
+/// blocks the grant whenever the code runs from a background thread of a
+/// foreground service — which is exactly how ConnectivityFallback runs.
+/// `appops set --uid` clears that restriction.
 ///
 /// POST_NOTIFICATIONS only exists on API 33+, where it must be granted
 /// at runtime before the foreground-service notification can be shown.
+///
+/// Best-effort: each command's outcome is logged so a silent failure is
+/// visible in the relay log.
 fn grant_runtime_permissions(serial: Option<&str>, sdk: u32) {
     if sdk >= 23 {
-        let _ = exec_adb(serial, vec![
-            "shell", "pm", "grant", GNIREHTET_PKG,
+        for perm in &[
             "android.permission.ACCESS_FINE_LOCATION",
-        ]);
-        let _ = exec_adb(serial, vec![
-            "shell", "pm", "grant", GNIREHTET_PKG,
             "android.permission.ACCESS_COARSE_LOCATION",
-        ]);
+        ] {
+            debug!(target: TAG, "Granting {} (package + uid)", perm);
+            if let Err(e) = exec_adb(serial, vec![
+                "shell", "pm", "grant", GNIREHTET_PKG, perm,
+            ]) {
+                warn!(target: TAG, "pm grant {} failed: {}", perm, e);
+            }
+            // Strip the "android.permission." prefix to get the appops
+            // op name (e.g. ACCESS_FINE_LOCATION).
+            let op = perm.strip_prefix("android.permission.").unwrap_or(perm);
+            if let Err(e) = exec_adb(serial, vec![
+                "shell", "appops", "set", "--uid", GNIREHTET_PKG, op, "allow",
+            ]) {
+                warn!(target: TAG, "appops --uid {} failed: {}", op, e);
+            }
+        }
     }
     if sdk >= 33 {
         let _ = exec_adb(serial, vec![
@@ -636,7 +655,13 @@ pub fn cmd_start(
     ensure_adb();
     if must_install_client(serial)? {
         cmd_install(serial)?;
-        thread::sleep(Duration::from_millis(500));
+        // Wait for the package manager to fully index the newly installed
+        // package before granting permissions. On Samsung ROMs, `pm grant`
+        // issued less than ~1 s after `pm install` returns fails silently
+        // with a "package does not have permission" style error, and the
+        // app then starts without ACCESS_FINE_LOCATION — which makes every
+        // WiFi SSID query return "<unknown ssid>".
+        thread::sleep(Duration::from_millis(1500));
     }
 
     // Grant permissions on every launch. Cheap and idempotent, and it
