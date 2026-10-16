@@ -7,6 +7,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
+import android.content.pm.ServiceInfo;
 import android.content.Intent;
 import android.os.Build;
 
@@ -121,7 +122,20 @@ public class Notifier {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             createNotificationChannel();
         }
-        context.startForeground(NOTIFICATION_ID, createNotification(false));
+        Notification notification = createNotification(false);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Foreground service types must be declared both in the manifest
+            // and passed here on API 29+. The LOCATION type is required for
+            // WifiManager.getScanResults() and WifiInfo.getSSID() to return
+            // real data from a background service; without it, the platform
+            // rejects location access even when ACCESS_FINE_LOCATION is
+            // granted and the service is running in the foreground.
+            context.startForeground(NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                            | ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
+        } else {
+            context.startForeground(NOTIFICATION_ID, notification);
+        }
     }
 
     public void stop() {
